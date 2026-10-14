@@ -1,0 +1,11 @@
+{
+  "framework": null,
+  "installCommand": "pip install --break-system-packages -r requirements.txt",
+  "buildCommand": "python3 build.py && python3 test_site.py",
+  "outputDirectory": "public",
+  "functions": {
+    "api/subscribe.py": {
+      "excludeFiles": "{public/**,__pycache__/**,.git/**}"
+    }
+  }
+}

@@ -34,9 +34,13 @@ jobs:
 
       - name: Build site
         # Feed errors are recorded in public/build-report.json and do not fail the build.
+        env:
+          BASE_URL: https://fermartinez430.github.io/StazNews
         run: python build.py
 
       - name: Test site
+        env:
+          BASE_URL: https://fermartinez430.github.io/StazNews
         run: python test_site.py
 
       - name: Upload Pages artifact
