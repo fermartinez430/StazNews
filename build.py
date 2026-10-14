@@ -1,7 +1,7 @@
 """StazGames static site generator. Usage: python build.py [--offline]"""
 import json, os, re, sys, html, datetime as dt
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 import requests, feedparser
 import config as C
 
@@ -37,6 +37,9 @@ LABELS = {
     "VGC": "VGC",
 }
 COPY = "Get the best free games and deals in your inbox every morning. Free, unsubscribe anytime."
+AFFILIATE_NOTICE = "Some deal links may be affiliate links that pay StazGames a commission at no extra cost to you."
+AMAZON_DISCLOSURE = "As an Amazon Associate I earn from qualifying purchases."
+OUTBOUND_REL = "sponsored nofollow noopener"
 
 def get(url, timeout=20):
     try:
@@ -248,6 +251,37 @@ def entry_image(entry):
                 return image
     return ""
 
+def match_store(url, store=""):
+    """Map a deal URL or store name onto an AFFILIATES key."""
+    host = urlparse(str(url or "")).netloc.lower()
+    name = re.sub(r"\s+", " ", str(store or "")).strip().lower()
+    if "amazon." in host or host.endswith("amzn.to") or name == "amazon":
+        return "amazon"
+    if "fanatical.com" in host or name == "fanatical":
+        return "fanatical"
+    if "greenmangaming.com" in host or name in {"green man gaming", "gmg"}:
+        return "gmg"
+    if "humblebundle.com" in host or "humblestore.com" in host or "humble" in name:
+        return "humble"
+    return ""
+
+def affiliate_params(key):
+    raw = (getattr(C, "AFFILIATES", {}) or {}).get(key) or {}
+    return {str(k): str(v) for k, v in raw.items() if str(k).strip() and str(v).strip()}
+
+def with_affiliate(url, store=""):
+    """Return (url, affiliate_active). Empty store config leaves the URL unchanged."""
+    url = str(url or "")
+    params = affiliate_params(match_store(url, store))
+    if not params:
+        return url, False
+    parts = urlsplit(url)
+    if "cheapshark.com" in parts.netloc.lower() and parts.path.rstrip("/").endswith("/redirect"):
+        return url, True
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update(params)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)), True
+
 def short_label(name):
     name = re.sub(r"\s+", " ", str(name or "")).strip()
     if name in LABELS:
@@ -378,8 +412,11 @@ ul.cards{list-style:none;padding:0;display:grid;gap:10px;grid-template-columns:1
 .signup button{padding:8px 14px;border:0;border-radius:6px;background:var(--acc);font-weight:700;cursor:pointer}
 .form-msg{flex-basis:100%;margin:4px 0 0}.form-msg.bad{color:#fca5a5}
 .hp{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-@media(max-width:699px){.thumb,.icon,.mark{width:96px;height:54px}.signup input[type=email],.signup button{flex:1 1 100%}}
-footer{color:var(--mut);font-size:.85rem;padding:24px 16px;border-top:1px solid var(--card);margin-top:32px}.empty{color:var(--mut);font-style:italic}"""
+.ad{display:inline-block;margin-left:6px;border:1px solid var(--mut);color:var(--mut);border-radius:4px;padding:0 5px;font-size:.68rem;font-weight:800;letter-spacing:.03em;vertical-align:middle}
+@media(max-width:699px){.thumb,.icon,.mark{width:96px;height:54px}.signup input[type=email],.signup button{flex:1 1 100%}.legal{gap:10px}}
+footer{color:var(--mut);font-size:.85rem;padding:24px 16px;border-top:1px solid var(--card);margin-top:32px}
+.legal{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 8px}.legal a{color:var(--mut)}
+.notice{margin:0 0 8px}.empty{color:var(--mut);font-style:italic}"""
 
 LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#18221d"/><ellipse cx="32" cy="38" rx="20" ry="16" fill="#a0703f"/><circle cx="25" cy="34" r="3" fill="#222"/><circle cx="39" cy="34" r="3" fill="#222"/><ellipse cx="32" cy="43" rx="7" ry="4" fill="#6b4423"/><path d="M12 32a20 20 0 0 1 40 0" stroke="#4ade80" stroke-width="5" fill="none"/><rect x="8" y="30" width="7" height="12" rx="3" fill="#4ade80"/><rect x="49" y="30" width="7" height="12" rx="3" fill="#4ade80"/></svg>'
 
@@ -419,8 +456,20 @@ def page(path, title, desc, body, updated, jsonld=()):
 <link rel="stylesheet" href="{href("/style.css")}">{lds}</head><body>
 <header><a class="logo" href="{href("/")}">Staz<span>Games</span></a><nav aria-label="Main">{nav}</nav></header>
 <main><p class="upd">Updated <time datetime="{iso}">{updated.strftime("%b %d, %Y %I:%M %p")} CT</time></p>{body}</main>
-<footer><p>{C.SITE_NAME} is run by {C.OPERATOR} and updated automatically. Follow <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a>. Some links may be affiliate links; see <a href="{href("/about/")}">About</a>. News headlines link to and credit their original publishers.</p></footer>
+{footer(path)}
 </body></html>"""
+
+def footer(path):
+    links = [("/disclosure/", "Disclosure"), ("/privacy/", "Privacy"), ("/contact/", "Contact"), ("/terms/", "Terms")]
+    nav = "".join(
+        f'<a href="{href(h)}"{" aria-current=page" if h == path else ""}>{name}</a>'
+        for h, name in links
+    )
+    return f"""<footer>
+<nav class="legal" aria-label="Legal">{nav}</nav>
+<p class="notice">{AFFILIATE_NOTICE}</p>
+<p>{C.SITE_NAME} is run by {C.OPERATOR} and updated automatically. Follow <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a>. News headlines link to and credit their original publishers.</p>
+</footer>"""
 
 def media_html(image, alt, badge, icon=""):
     if image:
@@ -439,8 +488,10 @@ def free_list(items, n=None):
     for g in items:
         ends = f' · ends <time datetime="{esc(g["ends"])}">{ct(g["ends"]) if "+" in g["ends"] or "Z" in g["ends"] else esc(g["ends"][:10])}</time>' if g.get("ends") else ""
         worth = f' · <s>{esc(g["worth"])}</s> <span class="price">Free</span>' if g.get("worth") and g["worth"] not in ("N/A", "0", "$0.00") else ' · <span class="price">Free</span>'
+        url, affiliate = with_affiliate(g.get("url"), g.get("platform") or g.get("source") or "")
+        label = '<span class="ad">Affiliate</span>' if affiliate else ""
         media = media_html(g.get("image"), g["title"], short_label(g.get("source") or g.get("platform")))
-        inner = f'<h3><a href="{esc(g["url"])}" rel="nofollow noopener">{esc(g["title"])}</a></h3><p class="meta">{esc(g["platform"])}{worth}{ends} · via {esc(g["source"])}</p>'
+        inner = f'<h3><a class="out" href="{esc(url)}" rel="{OUTBOUND_REL}">{esc(g["title"])}</a>{label}</h3><p class="meta">{esc(g["platform"])}{worth}{ends} · via {esc(g["source"])}</p>'
         li.append(card(media, inner))
     return '<ul class="cards">' + "".join(li) + "</ul>"
 
@@ -452,8 +503,10 @@ def deal_list(items, n=None):
         meta = f'<span class="badge">-{d["savings"]}%</span> <span class="price">${esc(d["price"])}</span> <s>${esc(d["normal"])}</s> at {esc(d["store"])}'
         if d.get("metacritic") not in (None, "0"):
             meta += " · Metacritic " + esc(d["metacritic"])
+        url, affiliate = with_affiliate(d.get("url"), d.get("store") or "")
+        label = '<span class="ad">Affiliate</span>' if affiliate else ""
         media = media_html(d.get("image"), d["title"], short_label(d.get("store")), d.get("icon"))
-        inner = f'<h3><a href="{esc(d["url"])}" rel="sponsored nofollow noopener">{esc(d["title"])}</a></h3><p class="meta">{meta}</p>'
+        inner = f'<h3><a class="out" href="{esc(url)}" rel="{OUTBOUND_REL}">{esc(d["title"])}</a>{label}</h3><p class="meta">{meta}</p>'
         li.append(card(media, inner))
     return '<ul class="cards">' + "".join(li) + "</ul>"
 
@@ -474,7 +527,7 @@ def itemlist(name, rows):
 
 def signup():
     action = esc(form_action())
-    privacy = esc(href("/newsletter/#privacy"))
+    privacy = esc(href("/privacy/"))
     return f"""<section class="signup" id="newsletter" aria-labelledby="nl"><h2 id="nl">Get the daily drop at 7 AM CT</h2>
 <p>{COPY} <a href="{privacy}">Privacy</a></p>
 <form class="signup-form" method="post" action="{action}">
@@ -519,8 +572,6 @@ document.querySelectorAll("form.signup-form").forEach(function(form){{
 }});
 </script>
 </section>"""
-
-PRIVACY = """<section id="privacy"><h2>Privacy</h2><p>We use your email only to send the daily StazGames note about free games and deals. Addresses are stored with Resend so we can mail you. We don't sell or share them. Unsubscribe anytime from the link in each email.</p></section>"""
 
 def load_font(size, bold):
     from PIL import ImageFont
@@ -605,14 +656,51 @@ def build(offline=False):
       f'<h1>Latest gaming news</h1><p>Headlines with a short summary. Read the full stories at the original publishers.</p>{news_list(news)}', jsonld=arts)
     P("/newsletter/", f"Daily Gaming Newsletter | {C.SITE_NAME}",
       "The StazGames morning email covers free games and the best deals. Joining is free, and you can unsubscribe anytime.",
-      f"<h1>The StazGames daily newsletter</h1>{form}{PRIVACY}")
+      f"<h1>The StazGames daily newsletter</h1>{form}")
     P("/about/", f"About {C.SITE_NAME} | Who Runs This Site",
       f"{C.SITE_NAME} is run by {C.OPERATOR}. Learn how our automated free-game and deal alerts work, plus our affiliate disclosure.",
       f"""<h1>About {C.SITE_NAME}</h1><p>{esc(C.TAGLINE)}</p>
 <h2>Who runs it</h2><p>{C.SITE_NAME} and <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a> are operated by {C.OPERATOR} (<a href="https://x.com/{C.OPERATOR_X}" rel="me">@{C.OPERATOR_X}</a>), based in US Central Time.</p>
 <h2>Automated account disclosure</h2><p>This site and the @{C.X_HANDLE} X account are updated automatically by software that checks public feeds (Epic Games Store, GamerPower, CheapShark and publisher RSS feeds). A human operator, {C.OPERATOR}, oversees it. Report mistakes to <a href="https://x.com/{C.OPERATOR_X}">@{C.OPERATOR_X}</a>.</p>
 <h2>News policy</h2><p>We publish headlines, a short summary, a thumbnail when the source provides one, and a credited link to the original publisher. We do not republish full articles.</p>
-<h2>Affiliate disclosure</h2><p><em>[Placeholder: final wording to be added once affiliate programs are approved.]</em> Some links may be affiliate or referral links. If you buy through them we may earn a small commission at no extra cost to you. Deal links currently go through CheapShark redirects.</p>""")
+<h2>Affiliate disclosure</h2><p>Some deal links may be affiliate links. Read the full <a href="{href("/disclosure/")}">affiliate disclosure</a>, including the Amazon Associates statement.</p>""")
+    P("/disclosure/", f"Affiliate disclosure | {C.SITE_NAME}",
+      f"How {C.SITE_NAME} uses affiliate links, including Amazon Associates, and who runs the site.",
+      f"""<h1>Affiliate disclosure</h1>
+<p>Some deal links may be affiliate links that pay {C.SITE_NAME} a commission at no extra cost to the reader. We pick deals from public store data. A commission does not raise the price you pay.</p>
+<p>{AMAZON_DISCLOSURE}</p>
+<p>{C.SITE_NAME} is run by {C.OPERATOR}. Game listings, news summaries, and the @{C.X_HANDLE} account are updated by automation that {C.OPERATOR} oversees.</p>
+<p>Questions go through <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a> on X.</p>""")
+    P("/privacy/", f"Privacy policy | {C.SITE_NAME}",
+      f"How {C.SITE_NAME} handles newsletter emails with Resend, affiliate cookies, and Vercel hosting logs.",
+      f"""<h1>Privacy policy</h1>
+<p>This policy covers {C.SITE_NAME}, run by {C.OPERATOR}.</p>
+<h2>Newsletter</h2>
+<p>If you join the daily email, we store your email address with Resend so we can send that message. You can unsubscribe anytime from the link in each email. We do not sell your data, and we do not share it with advertisers.</p>
+<h2>Affiliate links</h2>
+<p>Some deal and store links are affiliate links. When you click through, that store or its affiliate partner may set tracking cookies in your browser. Those cookies belong to the partner. {C.SITE_NAME} does not control them. See the <a href="{href("/disclosure/")}">affiliate disclosure</a>.</p>
+<h2>Hosting</h2>
+<p>The site is hosted on Vercel. Vercel keeps standard hosting logs, such as IP address, browser, and the page requested, to run and protect the service.</p>
+<h2>Contact</h2>
+<p>Privacy questions: {C.OPERATOR} on X at <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a> (<a href="https://x.com/{C.X_HANDLE}">https://x.com/{C.X_HANDLE}</a>).</p>""")
+    P("/contact/", f"Contact | {C.SITE_NAME}",
+      f"Reach {C.SITE_NAME} on X at @{C.X_HANDLE}. The site is run by {C.OPERATOR}.",
+      f"""<h1>Contact</h1>
+<p>{C.SITE_NAME} is run by {C.OPERATOR}. The site and @{C.X_HANDLE} are updated by automation that he oversees.</p>
+<p>Contact us on X: <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a> (<a href="https://x.com/{C.X_HANDLE}">https://x.com/{C.X_HANDLE}</a>).</p>""")
+    P("/terms/", f"Terms of use | {C.SITE_NAME}",
+      f"Short terms for using {C.SITE_NAME}, including deals, news summaries, and affiliate links.",
+      f"""<h1>Terms</h1>
+<p>By using {C.SITE_NAME} you agree to these terms.</p>
+<ul>
+<li>The site is information, not a store. Prices and giveaways change. Confirm the offer on the store's own page before you buy or claim it.</li>
+<li>Purchases and downloads are with the store, not with {C.SITE_NAME}.</li>
+<li>Some links may be affiliate links. Read the <a href="{href("/disclosure/")}">affiliate disclosure</a>.</li>
+<li>News items are short summaries with a link to the original publisher.</li>
+<li>The site is provided as is. We are not liable for a missed deal, a changed price, or a store's decision.</li>
+<li>These terms can be updated. The time at the top of this page is the current version.</li>
+</ul>
+<p>The site is run by {C.OPERATOR}. Questions go to <a href="https://x.com/{C.X_HANDLE}">@{C.X_HANDLE}</a> on X.</p>""")
     write("/404.html", page("/404.html", f"Page not found | {C.SITE_NAME}",
       "That page isn't on StazGames. Head back for free games, deals, and gaming news.",
       f'<h1>Page not found</h1><p>That page isn\'t on {C.SITE_NAME}. The free games, deals, and news are on the homepage.</p><p><a href="{href("/")}">Back to the homepage</a></p>',
@@ -633,6 +721,10 @@ def build(offline=False):
 - [Deals]({C.BASE_URL}/deals/): top-rated PC game discounts (CheapShark data)
 - [News]({C.BASE_URL}/news/): headlines with short summaries, linked to original publishers
 - [About]({C.BASE_URL}/about/): operator, automation and affiliate disclosures
+- [Disclosure]({C.BASE_URL}/disclosure/): affiliate disclosure, including Amazon Associates
+- [Privacy]({C.BASE_URL}/privacy/): newsletter emails, cookies, and hosting logs
+- [Contact]({C.BASE_URL}/contact/): reach the operator on X
+- [Terms]({C.BASE_URL}/terms/): short terms of use
 
 ## Data
 - [free-games.json]({C.BASE_URL}/data/free-games.json): JSON list of current free games
