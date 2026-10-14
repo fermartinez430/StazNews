@@ -60,7 +60,7 @@ def html_pages(out):
 
 def validate(out, external=False):
     pages = html_pages(out)
-    for req in ["/", "/free-games/", "/deals/", "/news/", "/about/", "/newsletter/", "/404.html"]: check(req in pages, f"missing page {req}")
+    for req in ["/", "/free-games/", "/deals/", "/news/", "/about/", "/newsletter/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/404.html"]: check(req in pages, f"missing page {req}")
     titles, descs, ext = set(), set(), set()
     for path, src in pages.items():
         try: html5lib.HTMLParser(strict=True).parse(src)
@@ -91,8 +91,32 @@ def validate(out, external=False):
             check('name="hp"' in src and 'name="email"' in src, f"{path}: signup fields missing")
             check("Coming soon" not in src and "Notify me" not in src, f"{path}: old signup copy remains")
             check('type="submit" disabled' not in src, f"{path}: submit still disabled")
-            check(build.href("/newsletter/#privacy") in src, f"{path}: privacy link missing")
+            check(build.href("/privacy/") in src, f"{path}: privacy link missing")
             check("fetch(form.action" in src, f"{path}: signup script missing")
+        for legal, dest in (("Disclosure", "/disclosure/"), ("Privacy", "/privacy/"), ("Contact", "/contact/"), ("Terms", "/terms/")):
+            check(f'href="{build.href(dest)}"' in src, f"{path}: footer missing {legal}")
+        check(build.AFFILIATE_NOTICE in src, f"{path}: footer affiliate notice missing")
+        check('aria-label="Legal"' in src, f"{path}: legal nav missing")
+        for a in p.tags.get("a", []):
+            if "out" in (a.get("class") or "").split():
+                check(a.get("rel") == "sponsored nofollow noopener", f"{path}: deal link rel {a.get('rel')} {a.get('href')}")
+        if path == "/disclosure/":
+            check(build.AMAZON_DISCLOSURE in src, f"{path}: Amazon sentence missing")
+            check("commission" in src and "no extra cost to the reader" in src, f"{path}: commission sentence missing")
+            check("Fernando Martinez" in src and "automation" in src, f"{path}: operator or automation missing")
+        if path == "/privacy/":
+            low = src.lower()
+            for phrase in ("resend", "unsubscribe anytime", "do not sell", "tracking cookies", "vercel", "hosting logs"):
+                check(phrase in low, f"{path}: missing {phrase}")
+            check("https://x.com/StazNews" in src, f"{path}: contact link missing")
+            check("mailto:" not in low and not re.search(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", src, re.I), f"{path}: email address published")
+        if path == "/contact/":
+            check("https://x.com/StazNews" in src and "@StazNews" in src, f"{path}: X contact missing")
+            check("Fernando Martinez" in src and "automation" in src, f"{path}: operator missing")
+            check("mailto:" not in src.lower() and not re.search(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", src, re.I), f"{path}: email address published")
+        if path == "/terms/":
+            check("By using StazGames you agree to these terms." in src, f"{path}: terms intro missing")
+            check(build.href("/disclosure/") in src, f"{path}: disclosure link missing")
         if path == "/404.html":
             check("Page not found" in src and "Back to the homepage" in src, f"{path}: 404 copy missing")
             check(f'href="{build.href("/")}"' in src, f"{path}: 404 missing home link")
@@ -128,7 +152,7 @@ def validate(out, external=False):
         j=json.load(open(os.path.join(out,"data",f))); check(isinstance(j.get(k),list) and j["count"]==len(j[k]), f"{f} malformed")
     llms = open(os.path.join(out,"llms.txt")).read()
     check(llms.startswith("# "), "llms.txt malformed")
-    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/data/free-games.json", "/data/deals.json"):
+    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json"):
         check(C.BASE_URL + frag in llms, f"llms.txt missing {C.BASE_URL}{frag}")
     css = open(os.path.join(out, "style.css"), encoding="utf-8").read()
     check("object-fit:cover" in css, "stylesheet missing object-fit:cover")
@@ -221,6 +245,7 @@ def test_cards():
     }])
     check('class="thumb"' in free and 'loading="lazy"' in free and 'width="160"' in free and 'height="90"' in free, "free card thumb attributes")
     check('alt="Halo"' in free, "free card alt")
+    check('rel="sponsored nofollow noopener"' in free and 'class="ad"' not in free, "free card outbound rel")
     badge = build.free_list([{
         "title": "Halo", "platform": "Epic Games Store", "source": "Epic Games",
         "url": "https://example.com/halo", "worth": "", "ends": "", "image": "",
@@ -232,17 +257,58 @@ def test_cards():
         "image": "", "icon": "https://www.cheapshark.com/img/stores/icons/0.png",
     }])
     check('class="icon"' in deal and 'alt="Steam icon"' in deal and "loading=\"lazy\"" in deal, "deal card favicon")
+    check('rel="sponsored nofollow noopener"' in deal and 'class="ad"' not in deal, "untagged deal should not be labeled")
     news = build.news_list([{
         "title": "A headline", "url": "https://example.com/story", "summary": "",
         "source": "IGN", "published": "2026-10-14T12:00:00+00:00", "image": "",
     }])
     check("<p></p>" not in news and 'class="mark"' in news and ">IGN<" in news, "thin news summary still rendered a paragraph")
+    check('rel="noopener"' in news and "sponsored" not in news, "news link marked as a deal")
     epic = build.safe_img("https://cdn1.epicgames.com/offer/abc/file.png")
     check("resize=1" in epic and "w=320" in epic and "h=180" in epic, f"epic image not resized: {epic}")
     future = build.safe_img("https://cdn.mos.cms.futurecdn.net/abc-1920-80.jpg")
     check(future.endswith("abc-480-80.jpg"), f"futurecdn image not resized: {future}")
     check(build.safe_img("javascript:alert(1)") == "", "javascript image url accepted")
     check(build.safe_img("") == "", "empty image url accepted")
+
+def test_affiliates():
+    check(C.AFFILIATES == {"humble": {}, "fanatical": {}, "gmg": {}, "amazon": {}}, f"default affiliate config {C.AFFILIATES}")
+    samples = {
+        "humble": ("https://www.humblebundle.com/store/hades", "Humble Store", "partner", "staz-humble"),
+        "fanatical": ("https://www.fanatical.com/en/game/hades", "Fanatical", "affiliate", "staz-fan"),
+        "gmg": ("https://www.greenmangaming.com/games/hades/", "Green Man Gaming", "tap_a", "staz-gmg"),
+        "amazon": ("https://www.amazon.com/dp/B00TEST", "Amazon", "tag", "staz-20"),
+    }
+    for key, (url, store, param, value) in samples.items():
+        plain, active = build.with_affiliate(url, store)
+        check(plain == url and active is False, f"empty {key} config changed {plain}")
+    saved = {k: dict(v) for k, v in C.AFFILIATES.items()}
+    try:
+        for key, (url, store, param, value) in samples.items():
+            C.AFFILIATES[key] = {param: value}
+            tagged, active = build.with_affiliate(url, store)
+            check(active and f"{param}={value}" in tagged, f"{key} tag missing from {tagged}")
+            C.AFFILIATES[key] = {}
+        C.AFFILIATES["amazon"] = {"tag": "staz-20"}
+        card = build.deal_list([{
+            "title": "Widget", "store": "Amazon", "price": "9.99", "normal": "19.99", "savings": 50,
+            "metacritic": None, "url": "https://www.amazon.com/dp/B00TEST?ref=sr",
+            "image": "", "icon": "",
+        }])
+        check("tag=staz-20" in card and 'class="ad"' in card and ">Affiliate<" in card, f"amazon card not labeled: {card}")
+        check('rel="sponsored nofollow noopener"' in card, "amazon card rel")
+        C.AFFILIATES["humble"] = {"partner": "staz-humble"}
+        redirect = "https://www.cheapshark.com/redirect?dealID=abc"
+        kept, active = build.with_affiliate(redirect, "Humble Store")
+        check(active and kept == redirect, f"CheapShark redirect rewritten: {kept}")
+        humble = build.deal_list([{
+            "title": "Widget", "store": "Humble Store", "price": "1.00", "normal": "2.00", "savings": 50,
+            "metacritic": None, "url": redirect, "image": "", "icon": "",
+        }])
+        check("dealID=abc" in humble and "partner=" not in humble and ">Affiliate<" in humble, f"humble redirect card {humble}")
+    finally:
+        C.AFFILIATES.clear()
+        C.AFFILIATES.update(saved)
 
 def test_subscribe():
     import importlib.util
@@ -347,6 +413,7 @@ def test_static_config():
 if __name__ == "__main__":
     test_summaries()
     test_cards()
+    test_affiliates()
     test_subscribe()
     test_static_config()
     n, e = validate(C.OUT_DIR, external="--external" in sys.argv)
