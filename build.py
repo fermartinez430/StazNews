@@ -1,5 +1,5 @@
 """StazGames static site generator. Usage: python build.py [--offline]"""
-import json, os, re, sys, html, datetime as dt
+import json, os, re, sys, html, time, datetime as dt
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 import requests, feedparser
@@ -41,11 +41,21 @@ AFFILIATE_NOTICE = "Some deal links may be affiliate links that pay StazGames a 
 AMAZON_DISCLOSURE = "As an Amazon Associate I earn from qualifying purchases."
 OUTBOUND_REL = "sponsored nofollow noopener"
 
-def get(url, timeout=20):
-    try:
-        r = requests.get(url, headers=UA, timeout=timeout); r.raise_for_status(); return r
-    except Exception as e:
-        FAILURES.append(f"{url}: {e}"); return None
+def get(url, timeout=20, attempts=1, backoff=2):
+    """Fetch a URL. Extra attempts are for callers that opt in; one failure is recorded."""
+    error = None
+    for attempt in range(attempts):
+        try:
+            r = requests.get(url, headers=UA, timeout=timeout); r.raise_for_status(); return r
+        except Exception as e:
+            error = e
+            if attempt + 1 < attempts:
+                time.sleep(backoff)
+    FAILURES.append(f"{url}: {error}"); return None
+
+def cheapshark_get(url):
+    """Deal and store calls. A single slow CheapShark response should not wipe the list."""
+    return get(url, timeout=45, attempts=3, backoff=2)
 
 def esc(s): return html.escape(str(s or ""), quote=True)
 def strip(s): return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(s or ""))).strip()
@@ -343,9 +353,9 @@ def fetch_gamerpower(offline=False):
 
 def fetch_deals(offline=False):
     if offline: return []
-    r = get("https://www.cheapshark.com/api/1.0/deals?storeID=1,7,11,25&sortBy=Deal%20Rating&pageSize=40&onSale=1")
+    r = cheapshark_get("https://www.cheapshark.com/api/1.0/deals?storeID=1,7,11,25&sortBy=Deal%20Rating&pageSize=40&onSale=1")
     stores = {}
-    s = get("https://www.cheapshark.com/api/1.0/stores")
+    s = cheapshark_get("https://www.cheapshark.com/api/1.0/stores")
     if s:
         try: stores = {x["storeID"]: x for x in s.json()}
         except Exception: pass
@@ -708,6 +718,13 @@ def build(offline=False):
     write("/style.css", CSS); write("/logo.svg", LOGO_SVG); write_og()
     write("/data/deals.json", json.dumps({"updated": now.isoformat(), "source": "CheapShark", "count": len(deals), "deals": deals}, indent=1, ensure_ascii=False))
     write("/data/free-games.json", json.dumps({"updated": now.isoformat(), "sources": ["Epic Games Store", "GamerPower"], "count": len(free), "games": free}, indent=1, ensure_ascii=False))
+    news_rows = []
+    for item in news:
+        row = {"title": item.get("title", ""), "source": item.get("source", ""), "url": item.get("url", ""), "summary": item.get("summary", "")}
+        if item.get("published"):
+            row["published"] = item["published"]
+        news_rows.append(row)
+    write("/data/news.json", json.dumps({"updated": now.isoformat(), "count": len(news_rows), "news": news_rows}, indent=1, ensure_ascii=False))
     write("/robots.txt", f"User-agent: *\nAllow: {href("/")}\n\nSitemap: {C.BASE_URL}/sitemap.xml\n")
     write("/sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
           "".join(f"<url><loc>{C.BASE_URL}{p}</loc><lastmod>{now.isoformat()}</lastmod><changefreq>hourly</changefreq></url>\n" for p in pages) + "</urlset>\n")
@@ -729,6 +746,7 @@ def build(offline=False):
 ## Data
 - [free-games.json]({C.BASE_URL}/data/free-games.json): JSON list of current free games
 - [deals.json]({C.BASE_URL}/data/deals.json): JSON list of current deals
+- [news.json]({C.BASE_URL}/data/news.json): JSON list of current gaming headlines
 
 ## Free right now
 {top}
