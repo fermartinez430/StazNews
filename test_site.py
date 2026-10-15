@@ -148,11 +148,25 @@ def validate(out, external=False):
     rb = open(os.path.join(out,"robots.txt")).read()
     check(f"Sitemap: {C.BASE_URL}/sitemap.xml" in rb, "robots.txt missing sitemap")
     check(f"Allow: {project_prefix() + '/' if project_prefix() else '/'}" in rb, "robots.txt allow path missing project subpath")
-    for f,k in [("deals.json","deals"),("free-games.json","games")]:
+    for f,k in [("deals.json","deals"),("free-games.json","games"),("news.json","news")]:
         j=json.load(open(os.path.join(out,"data",f))); check(isinstance(j.get(k),list) and j["count"]==len(j[k]), f"{f} malformed")
+        check(isinstance(j.get("updated"), str) and j["updated"], f"{f} missing updated")
+    news_doc = json.load(open(os.path.join(out, "data", "news.json"), encoding="utf-8"))
+    news_html = pages.get("/news/", "")
+    pos = 0
+    for item in news_doc["news"]:
+        for key in ("title", "source", "url", "summary"):
+            check(key in item, f"news.json item missing {key}")
+        if "published" in item:
+            check(isinstance(item["published"], str) and item["published"], "news.json published empty")
+        needle = build.esc(item.get("title") or "")
+        found = news_html.find(needle, pos) if needle else -1
+        check(bool(needle) and found >= 0, f"news.json title missing from news page: {item.get('title')}")
+        if found >= 0:
+            pos = found + len(needle)
     llms = open(os.path.join(out,"llms.txt")).read()
     check(llms.startswith("# "), "llms.txt malformed")
-    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json"):
+    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json"):
         check(C.BASE_URL + frag in llms, f"llms.txt missing {C.BASE_URL}{frag}")
     css = open(os.path.join(out, "style.css"), encoding="utf-8").read()
     check("object-fit:cover" in css, "stylesheet missing object-fit:cover")
@@ -394,6 +408,68 @@ def test_subscribe():
         server.shutdown()
         os.environ.pop("RESEND_API_KEY", None)
 
+def test_cheapshark_retry():
+    calls, sleeps = [], []
+
+    class Response:
+        def __init__(self, url):
+            self.url = url
+        def raise_for_status(self):
+            return None
+        def json(self):
+            if self.url.endswith("/stores"):
+                return [{"storeID": "1", "storeName": "Steam", "images": {}}]
+            return [{
+                "title": "Hades", "storeID": "1", "salePrice": "4.99", "normalPrice": "24.99",
+                "savings": "80", "metacriticScore": "93", "dealID": "abc", "thumb": "",
+            }, {
+                "title": "Hades", "storeID": "1", "salePrice": "1.00", "normalPrice": "2.00",
+                "savings": "50", "metacriticScore": "93", "dealID": "dup", "thumb": "",
+            }]
+
+    def flaky(url, headers=None, timeout=None):
+        calls.append((url, timeout))
+        seen = len([c for c in calls if c[0] == url])
+        if seen == 1:
+            raise requests.Timeout("read timed out")
+        return Response(url)
+
+    def down(url, headers=None, timeout=None):
+        calls.append((url, timeout))
+        raise requests.Timeout("read timed out")
+
+    old_get, old_sleep = build.requests.get, build.time.sleep
+    try:
+        build.requests.get = flaky
+        build.time.sleep = lambda seconds: sleeps.append(seconds)
+        build.FAILURES.clear()
+        calls.clear(); sleeps.clear()
+        one = build.get("https://example.com/feed")
+        check(one is None and len(calls) == 1 and calls[0][1] == 20 and sleeps == [], f"default get retried {calls} {sleeps}")
+        check(build.FAILURES == ["https://example.com/feed: read timed out"], f"default failure {build.FAILURES}")
+        build.FAILURES.clear()
+        calls.clear(); sleeps.clear()
+        deals = build.fetch_deals()
+        check(len(deals) == 1 and deals[0]["url"] == "https://www.cheapshark.com/redirect?dealID=abc", f"retry deals {deals}")
+        check(deals[0]["savings"] == 80 and deals[0]["store"] == "Steam", f"deal selection changed {deals}")
+        check(build.FAILURES == [], f"recovered CheapShark recorded {build.FAILURES}")
+        deal_calls = [c for c in calls if "/deals?" in c[0]]
+        store_calls = [c for c in calls if c[0].endswith("/stores")]
+        check(len(deal_calls) == 2 and len(store_calls) == 2, f"attempt counts {len(deal_calls)} {len(store_calls)}")
+        check(all(timeout == 45 for _, timeout in deal_calls + store_calls), f"CheapShark timeout {calls}")
+        check(sleeps == [2, 2], f"backoff {sleeps}")
+        build.requests.get = down
+        build.FAILURES.clear()
+        calls.clear(); sleeps.clear()
+        empty = build.fetch_deals()
+        check(empty == [], f"final failure returned deals {empty}")
+        check(len(build.FAILURES) == 2 and all("read timed out" in item and "cheapshark.com" in item for item in build.FAILURES), f"final failures {build.FAILURES}")
+        check(len(calls) == 6 and sleeps == [2, 2, 2, 2], f"final attempts {len(calls)} sleeps {sleeps}")
+    finally:
+        build.requests.get = old_get
+        build.time.sleep = old_sleep
+        build.FAILURES.clear()
+
 def test_static_config():
     import subprocess
     vercel = json.load(open("vercel.json", encoding="utf-8"))
@@ -415,6 +491,7 @@ if __name__ == "__main__":
     test_cards()
     test_affiliates()
     test_subscribe()
+    test_cheapshark_retry()
     test_static_config()
     n, e = validate(C.OUT_DIR, external="--external" in sys.argv)
     print(f"live build: {n} pages, {e} external links {'checked' if '--external' in sys.argv else 'found'}")
@@ -424,6 +501,7 @@ if __name__ == "__main__":
     home = open(C.OUT_DIR+"/index.html").read()
     check(home.count('class="empty"')==3, "empty-feed fallbacks not shown on home")
     check(json.load(open(C.OUT_DIR+"/data/deals.json"))["count"]==0, "empty deals.json wrong")
+    check(json.load(open(C.OUT_DIR+"/data/news.json"))["count"]==0, "empty news.json wrong")
     print("empty-feed build:", r)
     C.OUT_DIR = live_out
     print("FAIL\n- " + "\n- ".join(ERR) if ERR else "ALL TESTS PASSED"); sys.exit(1 if ERR else 0)
