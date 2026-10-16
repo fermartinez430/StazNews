@@ -121,10 +121,29 @@ def validate(out, external=False):
             check("Page not found" in src and "Back to the homepage" in src, f"{path}: 404 copy missing")
             check(f'href="{build.href("/")}"' in src, f"{path}: 404 missing home link")
         types=set()
+        docs=[]
         for raw in p.ld:
-            try: j=json.loads(raw); check("@context" in j and "@type" in j, f"{path}: JSON-LD missing @context/@type"); types.add(j["@type"])
+            try:
+                j=json.loads(raw)
+                docs.append(j)
+                check("@context" in j and "@type" in j, f"{path}: JSON-LD missing @context/@type")
+                types.add(j["@type"])
             except Exception as e: ERR.append(f"{path}: invalid JSON-LD {e}")
         check({"Organization","WebSite"} <= types, f"{path}: missing Org/WebSite JSON-LD")
+        if path in ("/deals/", "/free-games/") and 'class="cards"' in src:
+            lists = [j for j in docs if j.get("@type") == "ItemList"]
+            check(len(lists) == 1, f"{path}: expected one ItemList, got {len(lists)}")
+            elements = (lists[0].get("itemListElement") if lists else None) or []
+            check(elements and lists and lists[0].get("numberOfItems") == len(elements), f"{path}: ItemList count")
+            check(src.count("<h3>") == len(elements), f"{path}: ItemList size {len(elements)} vs cards {src.count('<h3>')}")
+            for el in elements:
+                item = el.get("item") or {}
+                offer = item.get("offers") or {}
+                check(isinstance(el.get("position"), int) and item.get("@type") == "Product" and item.get("name") and item.get("url"), f"{path}: ItemList entry {item.get('name')}")
+                if path == "/deals/":
+                    check(offer.get("priceCurrency") == "USD" and re.fullmatch(r"\d+\.\d{2}", str(offer.get("price") or "")), f"{path}: deal price {offer} for {item.get('name')}")
+                else:
+                    check(offer.get("price") == "0.00" and offer.get("priceCurrency") == "USD", f"{path}: free price {offer} for {item.get('name')}")
         for h in p.links:
             if h.startswith("/"):
                 tgt = local_file(out, h)
@@ -164,6 +183,10 @@ def validate(out, external=False):
         check(bool(needle) and found >= 0, f"news.json title missing from news page: {item.get('title')}")
         if found >= 0:
             pos = found + len(needle)
+        summary = item.get("summary") or ""
+        if summary:
+            check(build.esc(summary) in news_html, f"paraphrased summary missing from news page: {summary[:80]}")
+            check(build._norm_text(summary) != build._norm_text(item.get("title") or ""), f"news summary pastes the headline: {summary}")
     llms = open(os.path.join(out,"llms.txt")).read()
     check(llms.startswith("# "), "llms.txt malformed")
     for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json"):
@@ -278,6 +301,17 @@ def test_cards():
     }])
     check("<p></p>" not in news and 'class="mark"' in news and ">IGN<" in news, "thin news summary still rendered a paragraph")
     check('rel="noopener"' in news and "sponsored" not in news, "news link marked as a deal")
+    raw = "Nintendo has shown off Dark Link in The Legend of Zelda: Ocarina of Time remake for the first time."
+    voiced = build.news_list([{
+        "title": "Here's Our First Look at Dark Link",
+        "url": "https://example.com/story",
+        "summary": raw,
+        "source": "IGN",
+        "published": "2026-10-14T12:00:00+00:00",
+        "image": "",
+    }])
+    check("has shown off Dark Link" not in voiced and "first look" in voiced.lower() and "Nintendo" in voiced, f"news card not paraphrased: {voiced}")
+    check('href="https://example.com/story"' in voiced and "Source: IGN" in voiced and 'rel="noopener"' in voiced, "news card lost the link or source")
     epic = build.safe_img("https://cdn1.epicgames.com/offer/abc/file.png")
     check("resize=1" in epic and "w=320" in epic and "h=180" in epic, f"epic image not resized: {epic}")
     future = build.safe_img("https://cdn.mos.cms.futurecdn.net/abc-1920-80.jpg")
@@ -470,6 +504,40 @@ def test_cheapshark_retry():
         build.time.sleep = old_sleep
         build.FAILURES.clear()
 
+def test_voice_and_itemlist():
+    blurb = build.voice_blurb(
+        "The Switch 2 version of 007 First Light",
+        "The Switch 2 version of 007 First Light will launch on March 18, 2027.",
+        "Gematsu",
+    )
+    check("March 18, 2027" in blurb and "007" in blurb and blurb.endswith("."), f"launch paraphrase {blurb}")
+    check("Gematsu" in blurb and "will launch on March 18, 2027" not in blurb, f"feed sentence pasted {blurb}")
+    allowed = set(re.findall(r"\d+(?:\.\d+)?", "The Switch 2 version of 007 First Light will launch on March 18, 2027."))
+    found = set(re.findall(r"\d+(?:\.\d+)?", blurb))
+    check(found <= allowed, f"invented number {found - allowed} in {blurb}")
+    titled = build.voice_blurb("Modern Warfare 4 release times and early access explained", "", "PC Gamer")
+    check(titled.startswith("PC Gamer explains") and "early access" in titled, f"title paraphrase {titled}")
+    check("Modern Warfare 4 release times and early access explained" not in titled, f"headline pasted {titled}")
+    check(build.voice_blurb("T", "", "IGN") == "", f"thin headline kept {build.voice_blurb('T', '', 'IGN')}")
+    quoted = build.voice_blurb("A quote headline here", '"He talks about Gabe\'s yachts obsessively, so this is not an accident."', "PC Gamer")
+    check("Gabe's yachts" in quoted and "PC Gamer" in quoted and "He talks about Gabe" in quoted, f"quote dropped {quoted}")
+    deals = build.itemlist("Top game deals", [{
+        "title": "Hades", "url": "https://www.cheapshark.com/redirect?dealID=abc",
+        "price": "4.99", "normal": "24.99", "store": "Steam",
+    }])
+    item = deals["itemListElement"][0]["item"]
+    check(deals["@type"] == "ItemList" and deals["numberOfItems"] == 1, f"deal list {deals}")
+    check(item["name"] == "Hades" and item["url"].endswith("dealID=abc"), f"deal item {item}")
+    check(item["offers"]["price"] == "4.99" and item["offers"]["priceCurrency"] == "USD", f"deal offer {item}")
+    free = build.itemlist("Free games right now", [{
+        "title": "Halo", "url": "https://example.com/halo", "platform": "Epic Games Store", "worth": "$19.99",
+    }])
+    offer = free["itemListElement"][0]["item"]["offers"]
+    check(offer["price"] == "0.00" and offer["priceCurrency"] == "USD" and "19.99" not in str(offer), f"free offer {offer}")
+    plain = build.itemlist("Misc", [{"title": "X", "url": "https://example.com/x"}])
+    check("offers" not in plain["itemListElement"][0]["item"], f"unknown price got an offer {plain}")
+    check(build.schema_price({"price": "nope"}) is None, "unparsed price accepted")
+
 def test_static_config():
     import subprocess
     vercel = json.load(open("vercel.json", encoding="utf-8"))
@@ -489,6 +557,7 @@ def test_static_config():
 if __name__ == "__main__":
     test_summaries()
     test_cards()
+    test_voice_and_itemlist()
     test_affiliates()
     test_subscribe()
     test_cheapshark_retry()

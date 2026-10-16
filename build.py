@@ -179,6 +179,450 @@ def summarize(title, summary, source=""):
     out = " ".join(kept).strip() or clip_words(text)
     return "" if is_thin(out, title, source) else out
 
+PREP = r"(?:in|on|for|with|about|after|before|from|at|during|within|into|over|under|around|through|via)"
+
+def _norm_text(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+def same(a, b):
+    return bool(_norm_text(a)) and _norm_text(a) == _norm_text(b)
+
+def cap(text):
+    text = (text or "").strip()
+    return text[:1].upper() + text[1:] if text else text
+
+def lower_func(text):
+    return re.sub(r"^(The|A|An|This|That|Its|It's)\b", lambda m: m.group(1).lower(), (text or "").strip())
+
+def finish(text, ellipsis=False):
+    text = re.sub(r"\s+", " ", text or "").strip(" ,;:-–—")
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r",,+", ",", text)
+    if not text:
+        return ""
+    text = cap(text)
+    if ellipsis:
+        return text.rstrip(".!?… ") + "…"
+    if text[-1] not in ".!?":
+        text += "."
+    return text
+
+def mask_quotes(text):
+    quotes = []
+    def hold(m):
+        quotes.append(m.group(0))
+        return f"\x00{len(quotes)-1}\x00"
+    masked = re.sub(r"[“\"][^”\"]*[”\"]|[‘'][^’']*[’']", hold, text)
+    def restore(part):
+        return re.sub(r"\x00(\d+)\x00", lambda m: quotes[int(m.group(1))], part)
+    return masked, restore
+
+PREP_WORDS = {"in", "on", "for", "with", "about", "after", "before", "from", "at", "during", "within", "into", "over", "under", "around", "through", "via", "including", "of"}
+
+def front_prep(clause):
+    """Move a short, comma-free ending phrase ("for $12", "after October") to the front."""
+    masked, restore = mask_quotes(clause)
+    matches = list(re.finditer(rf"\s+({PREP})\b", masked, re.I))
+    for m in reversed(matches):
+        main = restore(masked[:m.start()]).strip(" ,;")
+        prep = restore(masked[m.start():]).strip(" ,;")
+        if "," in prep or not main:
+            continue
+        if main.split()[-1].lower().strip(".”\"'") in PREP_WORDS:
+            continue
+        if len(main.split()) >= 4 and 2 <= len(prep.split()) <= 8:
+            return f"{cap(prep)}, {lower_func(main)}"
+    return None
+
+def rewrite_one(core):
+    """Return 1 grammatical sentence-or-two (no source tag), or None."""
+    s = core.strip()
+    s = re.sub(r"\s+", " ", s)
+
+    m = re.fullmatch(r"[\"“](.+)[\"”]", s)
+    if m:
+        return f'The story quotes this line: "{m.group(1).strip()}"'
+
+    m = re.match(r"^(?P<who>.+?) has finally spoken up about (?P<what>.+)$", s)
+    if m:
+        return f"The remarks from {m.group('who')} are about {m.group('what')}"
+
+    m = re.match(r"^(?P<who>.+?) has shown off (?P<what>.+?) for the first time$", s)
+    if m:
+        return f"A first look at {m.group('what')} comes from {m.group('who')}"
+
+    m = re.match(r"^(?P<who>.+?) have returned to (?P<where>.+?) after (?P<why>.+)$", s)
+    if m:
+        return f"After {m.group('why')}, {m.group('who')} are back at {m.group('where')}"
+
+    m = re.match(r"^(?P<who>.+?) has revealed (?P<what>.+?), which is (?P<which>.+)$", s)
+    if m:
+        what = re.sub(r"^(his|her|their) approach for\s+", "", m.group("what"), flags=re.I)
+        return f"{m.group('who')} revealed an approach for {what}, described as {m.group('which')}"
+
+    m = re.match(r"^(?P<who>.+?) has revealed (?P<what>.+)$", s)
+    if m:
+        return f"What {m.group('who')} revealed is {m.group('what')}"
+
+    m = re.match(r"^(?P<who>.+?) has described (?P<what>.+?), which is currently known by its codename (?P<code>[^,]+), as (?P<how>.+)$", s)
+    if m:
+        how = m.group("how")
+        extra = ""
+        cut = re.split(r",\s*revealing\s+", how, maxsplit=1)
+        if len(cut) == 2:
+            how, extra = cut
+        line = f'{m.group("who")} calls {m.group("what")}, currently known by the codename {m.group("code")}, {how}'
+        if extra:
+            line += f". The note also says {extra}"
+        return line
+
+    m = re.match(r"^(?P<who>.+?) has described (?P<what>.+?) as (?P<how>.+)$", s)
+    if m:
+        return f"{m.group('who')} calls {m.group('what')} {m.group('how')}"
+
+    m = re.match(r"^(?P<what>.+?) is now available for (?P<where>.+)$", s)
+    if m:
+        where = m.group("where")
+        verb = "are" if " and " in where else "is"
+        return f"{where} {verb} where {lower_func(m.group('what'))} is out now"
+
+    m = re.match(r"^(?P<who>.+?) says (?P<what>.+)$", s)
+    if m:
+        what = m.group("what")
+        # "he has a "healthy separation" where Overwatch is no longer part of his life"
+        m2 = re.match(r"^(?:he|she|they) has (?P<a>.+?) where (?P<b>.+)$", what, re.I)
+        if m2:
+            return f'{m2.group("a")} is {m.group("who")}\'s account, and {m2.group("b")}'
+        return f"{what} is the account from {m.group('who')}"
+
+    m = re.match(r"^(?P<who>.+?) suggests (?P<what>.+)$", s)
+    if m:
+        return f"{cap(m.group('what'))}, which is the suggestion from {m.group('who')}"
+
+    m = re.match(r"^(?P<what>.+?) was allegedly cancell?ed by (?P<who>.+)$", s, re.I)
+    if m:
+        return f"{m.group('who')}, allegedly, cancelled {lower_func(m.group('what'))}"
+
+    m = re.match(r"^(?P<what>.+?), (?P<appos>.+), has been cancell?ed (?P<rest>.+)$", s, re.I)
+    if m:
+        return f"{m.group('what')} is cancelled {m.group('rest')}. The note calls it {m.group('appos')}"
+
+    m = re.match(r"^(?P<what>.+?) will launch (?P<rest>.+)$", s)
+    if m:
+        return f"A launch {m.group('rest')} is the plan for {lower_func(m.group('what'))}"
+
+    m = re.match(r"^(?P<what>.+?) will release (?P<rest>.+)$", s)
+    if m:
+        rest = m.group("rest")
+        if not re.match(r"(?i)^(the|a|an)\b", rest):
+            rest = "the " + lower_func(rest)
+        pause = "," if len(rest.split()) > 8 else ""
+        return f"{cap(rest)}{pause} is the release {m.group('what')} has lined up"
+
+    m = re.match(r"^(?P<what>.+?) will be (?P<rest>.+)$", s)
+    if m:
+        return f"Being {m.group('rest')} is the prospect for {lower_func(m.group('what'))}"
+
+    m = re.match(r"^(?P<who>.+?) can now (?P<a>.+?) and (?P<b>.+)$", s)
+    if m and len(m.group("a").split()) <= 10:
+        return f"{m.group('who')} can {m.group('a')} now. They can also {m.group('b')}"
+
+    m = re.match(r"^(?P<who>.+?) (?:has|have) released (?P<what>.+)$", s)
+    if m:
+        who = re.sub(r"^Publisher\s+", "publisher ", m.group("who"))
+        what = m.group("what")
+        verb = "are" if re.search(r"\band\b", what.split(",")[0]) else "is"
+        pause = "," if "," in what else ""
+        return f"{cap(what)}{pause} {verb} out from {who}"
+
+    m = re.match(r"^(?P<who>.+?) recently sat down with (?P<whom>.+)$", s)
+    if m:
+        return f"{m.group('whom')} recently sat down with {m.group('who')}"
+
+    m = re.match(r"^Recently, I visited (?P<rest>.+)$", s)
+    if m:
+        return f"The writer visited {m.group('rest')}"
+
+    m = re.match(r"^In my office, I have (?P<what>.+)$", s, re.I)
+    if m:
+        what = re.sub(r"\b[Mm]y\b", "their", m.group("what"))
+        return f"The writer describes {what} in their office"
+
+    m = re.match(r"^(?P<who>.+?) has discussed (?P<what>.+), calling it (?P<quote>.+)$", s)
+    if m:
+        return f"{m.group('who')} discussed {m.group('what')} and called it {m.group('quote').rstrip('.')}"
+
+    m = re.match(r"^(?P<what>.+?) may not be (?P<rest>.+)$", s)
+    if m:
+        return f"{cap(m.group('rest'))} is what {lower_func(m.group('what'))} may not be"
+
+    m = re.match(r"^(?P<what>.+?) adds (?P<rest>.+)$", s)
+    if m and len(m.group("what").split()) >= 2:
+        return f"{cap(m.group('rest'))} are what {lower_func(m.group('what'))} adds"
+
+    m = re.match(r"^It's in beta now, but will likely release widely in (?P<when>.+)$", s)
+    if m:
+        return f"A wide release in {m.group('when')} is the likely plan, and it is in beta now"
+
+    m = re.match(r"^In the wake of (?P<scene>[^,]+),\s*(?P<rest>.+)$", s)
+    if m:
+        return f"{m.group('rest').rstrip('.')}, in the wake of {m.group('scene')}"
+
+    m = re.match(r"^(?P<body>.+), it's claimed$", s, re.I)
+    if m:
+        return f"The claim is that {lower_func(m.group('body'))}"
+
+    m = re.match(r"^(?P<who>.+?) will introduce (?P<what>.+)$", s)
+    if m:
+        what = m.group("what")
+        pause = "," if "," in what else ""
+        return f"{cap(what)}{pause} is what {m.group('who')} will introduce"
+
+    m = re.match(r"^(?P<a>.+?) continues as we (?P<b>.+)$", s)
+    if m:
+        verb, _, rest = m.group("b").partition(" ")
+        if verb.endswith("y") and len(verb) > 1 and verb[-2].lower() not in "aeiou":
+            verb = verb[:-1] + "ies"
+        elif verb.endswith(("s", "sh", "ch", "x", "z", "o")):
+            verb = verb + "es"
+        else:
+            verb = verb + "s"
+        return f"{m.group('a')} continues. The piece {verb}{(' ' + rest) if rest else ''}"
+
+    m = re.match(r"^(?P<who>.+?) features (?P<what>.+)$", s)
+    if m and len(m.group("who").split()) >= 2:
+        return f"What {m.group('who')} features is {m.group('what')}"
+
+    m = re.match(r"^(?P<head>.+?),\s+but\s+(?P<tail>.+)$", s)
+    if m and len(m.group("head").split()) >= 4 and len(m.group("tail").split()) >= 4:
+        return f"{cap(m.group('tail'))}, but the earlier point is that {lower_func(m.group('head'))}"
+
+    m = re.match(r"^(?P<who>.+?) has explained (?P<what>.+)$", s)
+    if m and len(m.group("who").split()) <= 14:
+        return f"What {m.group('who')} explained is {m.group('what')}"
+
+    m = re.match(r"^(?P<what>.+?) have entered (?P<rest>.+)$", s)
+    if m:
+        return f"{m.group('what')} are in {m.group('rest')}"
+
+    m = re.match(r"^(?P<who>.+?) joins the show!?$", s)
+    if m:
+        return f"{m.group('who')} is joining the show"
+
+    m = re.match(r"^(?P<what>.+?) is well underway, with the latest seeing (?P<rest>.+)$", s)
+    if m:
+        return f"The latest sign is {m.group('rest')}, from {m.group('what')}, which the note calls well underway"
+
+    m = re.match(r"^(?P<what>.+?) is well underway, with (?P<rest>.+)$", s)
+    if m:
+        return f"{cap(m.group('rest'))} is the latest piece of {m.group('what')}, which the note calls well underway"
+
+    m = re.match(r"^(?P<who>.+?) said it (?:doesn't|doesn’t|does not) want to (?P<avoid>.+?), instead (?P<alt>.+)$", s)
+    if m:
+        avoid = re.sub(r"^do\s+", "", m.group("avoid"))
+        return f"Doing {avoid} is not what {lower_func(m.group('who'))} said it wants, and the alternative it names is {m.group('alt')}"
+
+    m = re.match(r"^(?P<head>.+?), and though (?P<though>.+?) were (?P<adj>well [\w]+), (?P<end>.+)$", s)
+    if m:
+        return f"{m.group('head')}, and {m.group('though')} were {m.group('adj')}. {cap(m.group('end'))}"
+
+    # Copula swap. Keep both sides intact so names and figures stay put.
+    m = re.match(r"^(?P<left>.+?)\s+is\s+(?P<right>.+)$", s)
+    if m:
+        left, right = m.group("left").strip(), m.group("right").strip()
+        if len(left.split()) >= 2 and 1 <= len(right.split()) <= 14:
+            if right.lower().startswith("not "):
+                return f"{cap(right)} is the description of {lower_func(left)}"
+            return f"{cap(right)} is {lower_func(left)}"
+
+    m = re.match(r"^(?P<left>.+?)\s+was\s+(?P<right>.+)$", s)
+    if m and len(m.group("right").split()) <= 14:
+        return f"{cap(m.group('right'))} is what the note records for {m.group('left')}"
+
+    flipped = front_prep(s)
+    if flipped and not same(flipped, s):
+        return flipped
+
+    m = re.match(r"^(?P<head>.+?),\s+with (?P<tail>.+)$", s)
+    if m and len(m.group("tail").split()) >= 3:
+        return f"{cap(m.group('tail'))} comes along with this: {lower_func(m.group('head'))}"
+
+    return None
+
+def place_ellipsis(bits, core):
+    """Keep a feed ellipsis on the clause that still holds the unfinished ending."""
+    tail = " ".join(core.split()[-3:]).lower()
+    placed = False
+    out = []
+    for bit in bits:
+        done = finish(bit)
+        if not placed and tail and tail in done.lower():
+            done = done.rstrip(".!?") + "…"
+            placed = True
+        out.append(done)
+    if not placed and out:
+        out[-1] = out[-1].rstrip(".!?") + "…"
+    return out
+
+def clean_core(raw):
+    core = re.sub(r"(?:…|\.\.\.)\s*$", "", raw).strip()
+    core = re.sub(r"[.!?]+$", "", core).strip()
+    core = re.sub(r'([.!?])\.(["”’\'])', r"\1\2", core)
+    core = re.sub(r'(["”])\.$', r"\1", core)
+    # A clipped teaser sometimes ends on a gerund whose object was cut off.
+    bits = core.split()
+    if bits and bits[-1].lower().strip(".”\"'") in {"introducing", "including", "calling", "featuring", "showing", "adding", "bringing"}:
+        core = " ".join(bits[:-1]).rstrip(" ,;")
+        return core, True
+    return core, False
+
+def rewrite_sentence(sentence, source):
+    raw = sentence.strip()
+    ellipsis = bool(re.search(r"(?:…|\.\.\.)\s*$", raw))
+    core, clipped = clean_core(raw)
+    ellipsis = ellipsis or clipped
+    rewritten = rewrite_one(core)
+    if not rewritten or same(rewritten, core):
+        # Keep an unmatched teaser grammatical. A midpoint split was producing fragments.
+        rewritten = f"{(source + ' notes that ') if source else ''}{lower_func(core)}"
+    bits = [b.strip() for b in re.split(r"(?<=[.!?])\s+", rewritten) if b.strip()][:2]
+    if ellipsis:
+        return " ".join(place_ellipsis(bits, core))
+    return " ".join(finish(bit) for bit in bits)
+
+VERB_MAP = {
+    "explained": "explains",
+    "announced": "has the announcement on",
+    "revealed": "reveals",
+    "confirmed": "confirms",
+    "detailed": "goes through",
+    "delayed": "covers a delay for",
+    "cancelled": "covers a cancellation of",
+    "canceled": "covers a cancellation of",
+    "released": "covers a release of",
+}
+
+def pull_trailing_quote(title):
+    """Return (bare headline, quote text or ''). Handles apostrophes inside single quotes."""
+    m = re.search(r"""[:]\s*(["“‘'])(.+)\1\s*$""", title)
+    if not m:
+        m = re.search(r"""[:]\s*(["“‘'])(.+)["”’']\s*$""", title)
+    if not m:
+        return title, ""
+    return title[:m.start()].strip(" :-–—"), m.group(2).strip()
+
+def voice_from_title(title, source):
+    t = strip(title).strip().rstrip(".")
+    bare, quote = pull_trailing_quote(t)
+    bare = re.sub(r"\s+", " ", bare).strip(" ,")
+    sentence = ""
+    m = re.match(r"^(?P<body>.+?)\s+(?P<verb>explained|announced|revealed|confirmed|detailed|delayed|cancelled|canceled|released)$", bare, re.I)
+    if m and len(m.group("body").split()) >= 2:
+        sentence = finish(f"{source} {VERB_MAP[m.group('verb').lower()]} {lower_func(m.group('body'))}")
+    else:
+        m = re.match(r"(?i)^here(?:'s| is)\s+(?:our\s+|your\s+|a\s+|the\s+)?(?P<rest>.+)$", bare)
+        if m:
+            sentence = finish(f"{source} shares {lower_func(m.group('rest'))}")
+        else:
+            m = re.match(r"^(?P<who>.+?)\s+explains why\s+(?P<why>.+)$", bare, re.I)
+            if m:
+                why = m.group("why")
+                extra = ""
+                cut = re.split(r",\s+and then\s+", why, maxsplit=1)
+                if len(cut) == 2:
+                    why, extra = cut
+                sentence = finish(f"Why {lower_func(why)} is what {m.group('who')} explains")
+                if extra and not quote:
+                    sentence += " " + finish(f"The headline also says {m.group('who').split()[-1]} then {extra}" if extra.lower().startswith("drops") else f"The headline also says {extra}")
+            else:
+                parts = re.split(r"\s*[:|–—]\s+|\s+-\s+", bare, maxsplit=1)
+                if len(parts) == 2 and len(parts[0].split()) >= 1 and len(parts[1].split()) >= 3:
+                    left, right = (p.strip() for p in parts)
+                    sentence = finish(f"{cap(lower_func(right))}") + " " + finish(f"That is what {source} is covering under {lower_func(left)}")
+                else:
+                    m = re.match(r"^(?P<body>.+),\s*(?P<who>[A-Z][\w.'’&-]*(?:\s+[\w.'’&-]+){0,4})\s+(?P<verb>confirms|says|announces|reveals|explains|reports)$", bare)
+                    if m and len(m.group("body").split()) >= 3:
+                        sentence = finish(f"{m.group('who')} {m.group('verb')} {lower_func(m.group('body'))}")
+                    else:
+                        m = re.match(r"(?i)^save\s+(?P<pct>\d+)%\s+off\s+(?P<what>.+?)(?:\s+well)?\s+ahead of\s+(?P<when>.+)$", bare)
+                        if m:
+                            sentence = finish(f"{source} notes {m.group('pct')}% off {m.group('what')}, ahead of {m.group('when')}")
+                        else:
+                            flipped = front_prep(bare)
+                            if flipped and not same(flipped, bare):
+                                sentence = finish(flipped)
+                            else:
+                                sentence = finish(f"{source} reports on {lower_func(bare)}")
+    if quote:
+        sentence += " " + finish(f'The headline quotes "{quote}"')
+    return sentence
+
+def title_pasted(blurb, title):
+    nt, nb = _norm_text(title), _norm_text(blurb)
+    if len(nt.split()) >= 6 and nt in nb:
+        return True
+    return same(blurb, title)
+
+def leaks_numbers(text, *parts):
+    allowed = set(re.findall(r"\d+(?:\.\d+)?", " ".join(parts)))
+    found = set(re.findall(r"\d+(?:\.\d+)?", text or ""))
+    return not found <= allowed
+
+def attach_source(text, source):
+    if not text or not source or re.search(rf"\b{re.escape(source)}\b", text, re.I):
+        return text
+    if text.startswith("The story quotes this line:"):
+        return f"Via {source}, the story quotes this line:{text.split(':', 1)[1]}"
+    parts = [p for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    if parts and parts[-1].endswith("…") and len(parts) >= 2 and parts[0][-1:] in ".!?":
+        parts[0] = parts[0][:-1] + f", via {source}{parts[0][-1]}"
+        return " ".join(parts)
+    if text.endswith("…"):
+        return text + f" Via {source}."
+    if text[-1] in ".!?":
+        return text[:-1] + f", via {source}{text[-1]}"
+    return text + f", via {source}."
+
+def strip_title_echo(title, summary):
+    """Drop a headline repeated before a colon, keeping the words after that separator.
+
+    "Title will launch…" stays intact so the headline can remain the subject of the sentence.
+    """
+    sw, tw = summary.split(), title.split()
+    if len(tw) >= 4 and len(sw) > len(tw) + 3 and _norm_text(" ".join(sw[:len(tw)])) == _norm_text(title):
+        rest = " ".join(sw[len(tw):]).lstrip()
+        if rest[:1] in ":|-–—" or sw[len(tw) - 1][-1:] in ":|-–—":
+            rest = rest.lstrip(":|-–— ")
+            if len(rest.split()) >= 4:
+                return rest
+    return summary
+
+def voice_blurb(title, summary, source=""):
+    """One or two original sentences from a cleaned teaser, or from the headline when the teaser is empty.
+
+    Facts stay inside the headline and the teaser. Glue words and the source name are the only additions.
+    """
+    title, summary, source = strip(title), strip(summary), strip(source)
+    if summary and same(summary, title):
+        summary = ""
+    if summary:
+        summary = strip_title_echo(title, summary)
+    if summary:
+        parts = [p for p in re.split(r"(?<=[.!?…])\s+", summary) if p.strip()][:2]
+        rewritten = [rewrite_sentence(p, source) for p in parts]
+        # Keep the blurb to two sentences.
+        sentences = []
+        for chunk in rewritten:
+            sentences.extend([s for s in re.split(r"(?<=[.!?…])\s+", chunk) if s.strip()])
+        text = " ".join(sentences[:2])
+    elif len(title.split()) >= 4 and not same(title, source):
+        text = voice_from_title(title, source)
+    else:
+        return ""
+    text = re.sub(r"\s+:\s*", ": ", text)
+    text = attach_source(text, source)
+    return text
+
 def shrink_image(url):
     parts = urlsplit(url)
     path, query = parts.path, parts.query
@@ -525,15 +969,41 @@ def news_list(items, n=None):
     if not items: return '<p class="empty">News feeds are temporarily unavailable. Please check back shortly.</p>'
     li = []
     for a in items:
-        summary = f'<p>{esc(a["summary"])}</p>' if a.get("summary") else ""
+        blurb = voice_blurb(a.get("title"), a.get("summary"), a.get("source"))
+        summary = f'<p>{esc(blurb)}</p>' if blurb else ""
         media = media_html(a.get("image"), a["title"], short_label(a.get("source")))
         inner = f'<h3><a href="{esc(a["url"])}" rel="noopener">{esc(a["title"])}</a></h3>{summary}<p class="meta">Source: {esc(a["source"])} · <time datetime="{esc(a["published"])}">{ct(a["published"])}</time></p>'
         li.append(card(media, inner))
     return '<ul class="cards">' + "".join(li) + "</ul>"
 
+def schema_price(row):
+    """Sale price as a USD string, or 0.00 for a free-to-keep listing. None when unknown."""
+    if "price" in row and str(row.get("price")).strip() not in ("", "None"):
+        raw = str(row["price"]).replace("$", "").replace(",", "").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return f"{value:.2f}"
+    if row.get("platform") and "price" not in row:
+        return "0.00"
+    return None
+
 def itemlist(name, rows):
+    """ItemList of the games or deals on the page, with a price when we have one."""
+    elements = []
+    for i, row in enumerate(rows):
+        title = row.get("title") or ""
+        url = row.get("url") or ""
+        item = {"@type": "Product", "name": title, "url": url}
+        price = schema_price(row)
+        if price is not None:
+            item["offers"] = {"@type": "Offer", "price": price, "priceCurrency": "USD", "url": url}
+        elements.append({"@type": "ListItem", "position": i + 1, "item": item})
     return {"@context": "https://schema.org", "@type": "ItemList", "name": name,
-            "itemListElement": [{"@type": "ListItem", "position": i + 1, "name": r["title"], "url": r["url"]} for i, r in enumerate(rows)]}
+            "numberOfItems": len(elements), "itemListElement": elements}
 
 def signup():
     action = esc(form_action())
@@ -663,7 +1133,7 @@ def build(offline=False):
              "publisher": {"@type": "Organization", "name": a["source"]}} for a in news[:20]]
     P("/news/", f"Latest Gaming News Headlines | {C.SITE_NAME}",
       "A fast roundup of today's gaming headlines from IGN, PC Gamer, VGC, Eurogamer and Gematsu, each with a short summary and a link to the source.",
-      f'<h1>Latest gaming news</h1><p>Headlines with a short summary. Read the full stories at the original publishers.</p>{news_list(news)}', jsonld=arts)
+      f'<h1>Latest gaming news</h1><p>Headlines with a short summary in our own words. Read the full stories at the original publishers.</p>{news_list(news)}', jsonld=arts)
     P("/newsletter/", f"Daily Gaming Newsletter | {C.SITE_NAME}",
       "The StazGames morning email covers free games and the best deals. Joining is free, and you can unsubscribe anytime.",
       f"<h1>The StazGames daily newsletter</h1>{form}")
@@ -720,7 +1190,8 @@ def build(offline=False):
     write("/data/free-games.json", json.dumps({"updated": now.isoformat(), "sources": ["Epic Games Store", "GamerPower"], "count": len(free), "games": free}, indent=1, ensure_ascii=False))
     news_rows = []
     for item in news:
-        row = {"title": item.get("title", ""), "source": item.get("source", ""), "url": item.get("url", ""), "summary": item.get("summary", "")}
+        row = {"title": item.get("title", ""), "source": item.get("source", ""), "url": item.get("url", ""),
+               "summary": voice_blurb(item.get("title"), item.get("summary"), item.get("source"))}
         if item.get("published"):
             row["published"] = item["published"]
         news_rows.append(row)
