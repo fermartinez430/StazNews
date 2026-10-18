@@ -130,20 +130,96 @@ def validate(out, external=False):
                 types.add(j["@type"])
             except Exception as e: ERR.append(f"{path}: invalid JSON-LD {e}")
         check({"Organization","WebSite"} <= types, f"{path}: missing Org/WebSite JSON-LD")
-        if path in ("/deals/", "/free-games/") and 'class="cards"' in src:
+        def check_itemlist(card_h3, price_kind):
             lists = [j for j in docs if j.get("@type") == "ItemList"]
             check(len(lists) == 1, f"{path}: expected one ItemList, got {len(lists)}")
             elements = (lists[0].get("itemListElement") if lists else None) or []
             check(elements and lists and lists[0].get("numberOfItems") == len(elements), f"{path}: ItemList count")
-            check(src.count("<h3>") == len(elements), f"{path}: ItemList size {len(elements)} vs cards {src.count('<h3>')}")
+            check(card_h3 == len(elements), f"{path}: ItemList size {len(elements)} vs cards {card_h3}")
             for el in elements:
                 item = el.get("item") or {}
                 offer = item.get("offers") or {}
                 check(isinstance(el.get("position"), int) and item.get("@type") == "Product" and item.get("name") and item.get("url"), f"{path}: ItemList entry {item.get('name')}")
-                if path == "/deals/":
+                if price_kind == "deal":
                     check(offer.get("priceCurrency") == "USD" and re.fullmatch(r"\d+\.\d{2}", str(offer.get("price") or "")), f"{path}: deal price {offer} for {item.get('name')}")
                 else:
                     check(offer.get("price") == "0.00" and offer.get("priceCurrency") == "USD", f"{path}: free price {offer} for {item.get('name')}")
+        if path == "/deals/" and 'class="cards"' in src:
+            check_itemlist(src.count("<h3>"), "deal")
+        if path == "/free-games/":
+            now_m = re.search(r'<section id="free-now"[^>]*>(.*?)</section>', src, re.S)
+            check(now_m is not None, f"{path}: missing free-now section")
+            now_h3 = now_m.group(1).count("<h3>") if now_m else 0
+            if now_h3:
+                check_itemlist(now_h3, "free")
+            else:
+                lists = [j for j in docs if j.get("@type") == "ItemList"]
+                check(not lists, f"{path}: ItemList without current free games")
+            faqs = [j for j in docs if j.get("@type") == "FAQPage"]
+            check(len(faqs) == 1, f"{path}: expected one FAQPage, got {len(faqs)}")
+            entities = (faqs[0].get("mainEntity") if faqs else None) or []
+            check(faqs and faqs[0].get("@context") == "https://schema.org", f"{path}: FAQPage context")
+            names = [q.get("name") for q in entities]
+            check(names == [
+                "What games are free on Epic right now?",
+                "When is the next free Epic game?",
+                "How long do I have to claim a free game?",
+                "What do these Epic games normally cost?",
+            ], f"{path}: FAQ questions {names}")
+            answers = {}
+            for q in entities:
+                ans = q.get("acceptedAnswer") or {}
+                check(q.get("@type") == "Question" and ans.get("@type") == "Answer" and ans.get("text"), f"{path}: FAQ entry {q.get('name')}")
+                check(f"<h3>{build.esc(q.get('name'))}</h3>" in src, f"{path}: FAQ question not visible {q.get('name')}")
+                check(f"<p>{build.esc(ans.get('text'))}</p>" in src, f"{path}: FAQ answer not visible {q.get('name')}")
+                answers[q.get("name")] = ans.get("text") or ""
+            fg = json.load(open(os.path.join(out, "data", "free-games.json"), encoding="utf-8"))
+            epic_now = [g for g in fg.get("games") or [] if g.get("source") == "Epic Games"]
+            current_a = answers.get("What games are free on Epic right now?", "")
+            next_a = answers.get("When is the next free Epic game?", "")
+            claim_a = answers.get("How long do I have to claim a free game?", "")
+            cost_a = answers.get("What do these Epic games normally cost?", "")
+            if epic_now:
+                for g in epic_now:
+                    check(g["title"] in current_a, f"FAQ missed current Epic game {g['title']}")
+                    when = build.ct(g.get("ends") or "")
+                    if when:
+                        check(when in claim_a, f"FAQ claim answer missed {when}")
+                    price = build.listed_price(g.get("worth"))
+                    if price:
+                        check(g["title"] in cost_a and price in cost_a, f"FAQ cost answer missed {g['title']}")
+            else:
+                check("No Epic Games Store game is free" in current_a, "empty Epic FAQ")
+            coming_m = re.search(r'<section id="coming-next"[^>]*>(.*?)</section>', src, re.S)
+            upcoming = fg.get("upcoming") or []
+            if upcoming:
+                check(coming_m is not None, "upcoming games missing Coming next section")
+                block = coming_m.group(0) if coming_m else ""
+                check('<h2 id="coming-next-title">Coming next on Epic</h2>' in block, "coming next heading")
+                now_html = now_m.group(0) if now_m else ""
+                for g in upcoming:
+                    check(build.esc(g["title"]) in block, f"upcoming card missing {g['title']}")
+                    check(build.esc(g["title"]) not in now_html, f"upcoming game listed as current {g['title']}")
+                    check(g["title"] in next_a, f"FAQ next answer missed {g['title']}")
+                    for iso_key in ("starts", "ends"):
+                        label = build.ct(g.get(iso_key) or "")
+                        check(label and label in block, f"upcoming {iso_key} missing for {g['title']}")
+                        check(label in next_a, f"FAQ next answer missed {label}")
+                    price = build.listed_price(g.get("worth"))
+                    if price:
+                        check(build.esc(price) in block, f"upcoming price missing {price}")
+                        check(g["title"] in cost_a and price in cost_a, f"FAQ cost answer missed upcoming {g['title']}")
+            else:
+                check(coming_m is None and "Coming next on Epic" not in src, "empty upcoming still rendered")
+                check("not announced" in next_a, "empty next FAQ")
+            home = pages.get("/", "")
+            if upcoming:
+                check("Coming next on Epic" in home, "homepage missing coming next mention")
+                check(build.href("/free-games/") + "#coming-next" in home, "homepage missing coming next link")
+                for g in upcoming[:4]:
+                    check(build.esc(g["title"]) in home, f"homepage mention missed {g['title']}")
+            else:
+                check("Coming next on Epic" not in home, "homepage mention rendered with no upcoming games")
         for h in p.links:
             if h.startswith("/"):
                 tgt = local_file(out, h)
@@ -170,6 +246,20 @@ def validate(out, external=False):
     for f,k in [("deals.json","deals"),("free-games.json","games"),("news.json","news")]:
         j=json.load(open(os.path.join(out,"data",f))); check(isinstance(j.get(k),list) and j["count"]==len(j[k]), f"{f} malformed")
         check(isinstance(j.get("updated"), str) and j["updated"], f"{f} missing updated")
+    free_doc = json.load(open(os.path.join(out, "data", "free-games.json"), encoding="utf-8"))
+    check(isinstance(free_doc.get("upcoming"), list), "free-games.json upcoming missing")
+    game_keys = {"title", "platform", "source", "url", "worth", "ends", "image"}
+    for g in free_doc["games"]:
+        check(set(g) == game_keys, f"free game shape changed {sorted(set(g) ^ game_keys)} on {g.get('title')}")
+    for g in free_doc["upcoming"]:
+        check(set(g) == game_keys | {"starts"}, f"upcoming shape {sorted(set(g))} on {g.get('title')}")
+        check(g.get("source") == "Epic Games" and g.get("platform") == "Epic Games Store", f"upcoming source {g.get('title')}")
+        try:
+            start = build.dt.datetime.fromisoformat(g["starts"])
+            end = build.dt.datetime.fromisoformat(g["ends"])
+            check(start < end, f"upcoming window {g.get('title')}")
+        except Exception as exc:
+            check(False, f"upcoming dates {g.get('title')} {exc}")
     news_doc = json.load(open(os.path.join(out, "data", "news.json"), encoding="utf-8"))
     news_html = pages.get("/news/", "")
     pos = 0
@@ -191,6 +281,13 @@ def validate(out, external=False):
     check(llms.startswith("# "), "llms.txt malformed")
     for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json"):
         check(C.BASE_URL + frag in llms, f"llms.txt missing {C.BASE_URL}{frag}")
+    check("## Coming next" in llms, "llms.txt missing Coming next")
+    coming_txt = llms.split("## Coming next", 1)[-1]
+    if free_doc.get("upcoming"):
+        for g in free_doc["upcoming"]:
+            check(g["title"] in coming_txt, f"llms.txt missing upcoming {g['title']}")
+    else:
+        check("None scheduled" in coming_txt, "llms.txt missing empty coming next")
     css = open(os.path.join(out, "style.css"), encoding="utf-8").read()
     check("object-fit:cover" in css, "stylesheet missing object-fit:cover")
     check("max-width:699px" in css, "stylesheet missing the under-700px rule")
@@ -538,6 +635,121 @@ def test_voice_and_itemlist():
     check("offers" not in plain["itemListElement"][0]["item"], f"unknown price got an offer {plain}")
     check(build.schema_price({"price": "nope"}) is None, "unparsed price accepted")
 
+def test_epic_upcoming_and_faq():
+    import datetime as dt
+    now = dt.datetime(2026, 10, 18, 18, 0, tzinfo=dt.timezone.utc)
+    elements = [
+        {
+            "title": "Bad Cheese",
+            "productSlug": "bad-cheese",
+            "price": {"totalPrice": {"fmtPrice": {"originalPrice": "$12.99"}}},
+            "keyImages": [],
+            "promotions": {
+                "promotionalOffers": [{"promotionalOffers": [{
+                    "startDate": "2026-10-15T15:00:00.000Z",
+                    "endDate": "2026-10-22T15:00:00.000Z",
+                    "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 0},
+                }]}],
+                "upcomingPromotionalOffers": [{"promotionalOffers": [{
+                    "startDate": "2026-11-05T15:00:00.000Z",
+                    "endDate": "2026-11-12T15:00:00.000Z",
+                    "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 0},
+                }]}],
+            },
+        },
+        {
+            "title": "Sker Ritual",
+            "productSlug": "sker-ritual",
+            "price": {"totalPrice": {"fmtPrice": {"originalPrice": "$24.99"}}},
+            "keyImages": [],
+            "promotions": {"upcomingPromotionalOffers": [{"promotionalOffers": [
+                {
+                    "startDate": "2026-10-19T15:00:00.000Z",
+                    "endDate": "2026-11-02T16:00:00.000Z",
+                    "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 20},
+                },
+                {
+                    "startDate": "2026-12-10T16:00:00.000Z",
+                    "endDate": "2027-01-07T16:00:00.000Z",
+                    "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 0},
+                },
+                {
+                    "startDate": "2026-10-22T15:00:00.000Z",
+                    "endDate": "2026-10-29T15:00:00.000Z",
+                    "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 0},
+                },
+            ]}]},
+        },
+        {
+            "title": "Home - A Unique Horror Adventure",
+            "productSlug": "home",
+            "price": {"totalPrice": {"fmtPrice": {"originalPrice": "$4.99"}}},
+            "keyImages": [],
+            "promotions": {"upcomingPromotionalOffers": [{"promotionalOffers": [{
+                "startDate": "2026-10-22T15:00:00.000Z",
+                "endDate": "2026-10-29T15:00:00.000Z",
+                "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 0},
+            }]}]},
+        },
+        {
+            "title": "Eternal Threads",
+            "productSlug": "eternal-threads",
+            "price": {"totalPrice": {"fmtPrice": {"originalPrice": "$19.99"}}},
+            "keyImages": [],
+            "promotions": {"upcomingPromotionalOffers": [{"promotionalOffers": [{
+                "startDate": "2026-10-19T15:00:00.000Z",
+                "endDate": "2026-11-02T16:00:00.000Z",
+                "discountSetting": {"discountType": "PERCENTAGE", "discountPercentage": 20},
+            }]}]},
+        },
+        {
+            "title": "Broken Offer",
+            "promotions": {"upcomingPromotionalOffers": [{"promotionalOffers": [{
+                "startDate": "not-a-date",
+                "endDate": "also-not",
+                "discountSetting": {"discountPercentage": 0},
+            }]}]},
+        },
+    ]
+    build.FAILURES.clear()
+    try:
+        current, upcoming = build.parse_epic_catalog(elements, now=now)
+        check([g["title"] for g in current] == ["Bad Cheese"], f"current epic {current}")
+        check(set(current[0]) == {"title", "platform", "source", "url", "worth", "ends", "image"}, f"current shape {current[0]}")
+        check("starts" not in current[0] and current[0]["worth"] == "$12.99", f"current price {current[0]}")
+        check([g["title"] for g in upcoming] == ["Home - A Unique Horror Adventure", "Sker Ritual"], f"upcoming {upcoming}")
+        check(upcoming[1]["worth"] == "$24.99" and upcoming[1]["starts"].startswith("2026-10-22T15:00:00"), f"sker window {upcoming[1]}")
+        check(upcoming[1]["url"].endswith("/p/sker-ritual"), f"sker url {upcoming[1]['url']}")
+        check("Eternal Threads" not in [g["title"] for g in upcoming] and "Broken Offer" not in [g["title"] for g in upcoming], f"paid or broken included {upcoming}")
+        check(any(item.startswith("epic upcoming:") for item in build.FAILURES), f"broken offer not recorded {build.FAILURES}")
+        check(build.omit_listed(upcoming, [{"title": "Sker Ritual (Epic Games)"}])[0]["title"] == "Home - A Unique Horror Adventure", "normalized title still listed as upcoming")
+        check(build.upcoming_section([]) == "" and build.upcoming_mention([]) == "", "empty upcoming rendered")
+        section = build.upcoming_section(upcoming)
+        check("Coming next on Epic" in section and "$24.99" in section and "$4.99" in section, f"section prices {section}")
+        check("Oct 22, 10:00 AM CT" in section and "Oct 29, 10:00 AM CT" in section, f"section dates {section}")
+        check('rel="sponsored nofollow noopener"' in section and 'class="ad"' not in section, "upcoming card rel")
+        mention = build.upcoming_mention(upcoming)
+        check("Coming next on Epic" in mention and "Sker Ritual ($24.99)" in mention and "#coming-next" in mention, f"mention {mention}")
+        check("<h3>" not in mention and "Oct 22, 10:00 AM CT" in mention, f"mention dates {mention}")
+        entries = dict(build.faq_entries(current, upcoming))
+        check("Bad Cheese" in entries["What games are free on Epic right now?"] and "$12.99" in entries["What games are free on Epic right now?"], entries)
+        check("Sker Ritual" in entries["When is the next free Epic game?"] and "Home - A Unique Horror Adventure" in entries["When is the next free Epic game?"], entries)
+        check("Eternal Threads" not in entries["When is the next free Epic game?"], entries)
+        check("Oct 22, 10:00 AM CT" in entries["How long do I have to claim a free game?"], entries)
+        check("$24.99" in entries["What do these Epic games normally cost?"] and "$4.99" in entries["What do these Epic games normally cost?"], entries)
+        empty = dict(build.faq_entries([], []))
+        check(len(empty) == 4 and "No Epic Games Store game is free" in empty["What games are free on Epic right now?"], empty)
+        check("not announced" in empty["When is the next free Epic game?"], empty)
+        check("Coming next on Epic" not in " ".join(empty.values()), empty)
+        ld = build.faq_jsonld(list(empty.items()))
+        raw = json.dumps(ld)
+        check(ld["@context"] == "https://schema.org" and ld["@type"] == "FAQPage" and len(ld["mainEntity"]) == 4, ld)
+        check(json.loads(raw)["mainEntity"][0]["acceptedAnswer"]["@type"] == "Answer", "FAQ JSON-LD answer")
+        check(build.parse_epic_catalog([], now=now) == ([], []), "empty catalog")
+        check(build.parse_epic_catalog({"nope": True}, now=now) == ([], []), f"bad catalog {build.FAILURES}")
+    finally:
+        build.FAILURES.clear()
+
 def test_static_config():
     import subprocess
     vercel = json.load(open("vercel.json", encoding="utf-8"))
@@ -561,6 +773,7 @@ if __name__ == "__main__":
     test_affiliates()
     test_subscribe()
     test_cheapshark_retry()
+    test_epic_upcoming_and_faq()
     test_static_config()
     n, e = validate(C.OUT_DIR, external="--external" in sys.argv)
     print(f"live build: {n} pages, {e} external links {'checked' if '--external' in sys.argv else 'found'}")

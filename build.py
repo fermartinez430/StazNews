@@ -757,28 +757,111 @@ def epic_image(game):
             return safe_img(image["url"])
     return ""
 
-def fetch_epic(offline=False):
-    if offline: return []
-    r = get("https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US")
-    out = []
-    if not r: return out
+def norm_title(title):
+    return re.sub(r"\s*\([^)]*\)\s*$", "", title or "").strip().lower()
+
+def epic_slug(game):
+    return (game.get("productSlug") or "") or next((m.get("pageSlug") for m in (game.get("catalogNs") or {}).get("mappings") or [] if m.get("pageSlug")), "") or (game.get("offerMappings") or [{}])[0].get("pageSlug", "")
+
+def epic_full_discount(offer):
+    """True when Epic is giving the game away.
+
+    The promotions API stores a 100% discount as discountPercentage 0.
+    Any other percentage is a paid sale and is not free to keep.
+    """
+    if not isinstance(offer, dict):
+        return False
+    return (offer.get("discountSetting") or {}).get("discountPercentage") == 0
+
+def epic_span(offer):
+    start = dt.datetime.fromisoformat(offer["startDate"].replace("Z", "+00:00"))
+    end = dt.datetime.fromisoformat(offer["endDate"].replace("Z", "+00:00"))
+    return start, end
+
+def epic_game(game, end, start=None):
+    slug = epic_slug(game)
+    row = {"title": game["title"], "platform": "Epic Games Store", "source": "Epic Games",
+        "url": f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/free-games",
+        "worth": (game.get("price") or {}).get("totalPrice", {}).get("fmtPrice", {}).get("originalPrice", ""),
+        "ends": end.isoformat(), "image": epic_image(game)}
+    if start is None:
+        return row
+    return {"title": row["title"], "platform": row["platform"], "source": row["source"], "url": row["url"],
+        "worth": row["worth"], "starts": start.isoformat(), "ends": row["ends"], "image": row["image"]}
+
+def parse_epic_catalog(elements, now=None):
+    """Split an Epic free-games catalog into current and upcoming free-to-keep titles.
+
+    Upcoming reads upcomingPromotionalOffers only, and only 100% discounts
+    (discountPercentage 0) that have not started. A bad offer is recorded and
+    skipped. It does not drop games already parsed and it does not raise.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    current = []
+    if not isinstance(elements, list):
+        FAILURES.append("epic parse: catalog elements missing")
+        return [], []
     try:
-        now = dt.datetime.now(dt.timezone.utc)
-        for g in r.json()["data"]["Catalog"]["searchStore"]["elements"]:
+        for g in elements:
             promos = (g.get("promotions") or {}).get("promotionalOffers") or []
             for p in promos:
                 for o in p.get("promotionalOffers", []):
-                    if (o.get("discountSetting") or {}).get("discountPercentage") != 0: continue
-                    end = dt.datetime.fromisoformat(o["endDate"].replace("Z", "+00:00"))
-                    start = dt.datetime.fromisoformat(o["startDate"].replace("Z", "+00:00"))
-                    if not (start <= now <= end): continue
-                    slug = (g.get("productSlug") or "") or next((m.get("pageSlug") for m in (g.get("catalogNs") or {}).get("mappings") or [] if m.get("pageSlug")), "") or (g.get("offerMappings") or [{}])[0].get("pageSlug", "")
-                    out.append({"title": g["title"], "platform": "Epic Games Store", "source": "Epic Games",
-                        "url": f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/free-games",
-                        "worth": (g.get("price") or {}).get("totalPrice", {}).get("fmtPrice", {}).get("originalPrice", ""),
-                        "ends": end.isoformat(), "image": epic_image(g)})
-    except Exception as e: FAILURES.append(f"epic parse: {e}")
-    return out
+                    if not epic_full_discount(o):
+                        continue
+                    start, end = epic_span(o)
+                    if not (start <= now <= end):
+                        continue
+                    current.append(epic_game(g, end))
+    except Exception as e:
+        FAILURES.append(f"epic parse: {e}")
+    upcoming = []
+    seen = {g.get("title") for g in current if g.get("title")}
+    for g in elements:
+        title = ""
+        try:
+            if not isinstance(g, dict):
+                continue
+            title = g.get("title") or ""
+            if not title or title in seen:
+                continue
+            best = None
+            groups = (g.get("promotions") or {}).get("upcomingPromotionalOffers") or []
+            for group in groups:
+                offers = group.get("promotionalOffers", []) if isinstance(group, dict) else []
+                for offer in offers or []:
+                    if not epic_full_discount(offer):
+                        continue
+                    start, end = epic_span(offer)
+                    if not (now < start and start < end):
+                        continue
+                    if best is None or (start, end) < best:
+                        best = (start, end)
+            if best:
+                upcoming.append(epic_game(g, best[1], best[0]))
+                seen.add(title)
+        except Exception as e:
+            FAILURES.append(f"epic upcoming: {title or 'game'}: {e}")
+    upcoming.sort(key=lambda row: (row.get("starts") or "", row.get("title") or ""))
+    return current, upcoming
+
+def fetch_epic(offline=False):
+    """Return (current, upcoming) Epic free-to-keep games. Offline or a bad response is empty."""
+    if offline:
+        return [], []
+    r = get("https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US")
+    if not r:
+        return [], []
+    try:
+        elements = r.json()["data"]["Catalog"]["searchStore"]["elements"]
+    except Exception as e:
+        FAILURES.append(f"epic parse: {e}")
+        return [], []
+    return parse_epic_catalog(elements)
+
+def omit_listed(upcoming, listed):
+    """Drop upcoming titles that are already on the current free list."""
+    have = {norm_title(g.get("title")) for g in listed}
+    return [g for g in upcoming if norm_title(g.get("title")) not in have]
 
 def fetch_gamerpower(offline=False):
     if offline: return []
@@ -870,7 +953,8 @@ ul.cards{list-style:none;padding:0;display:grid;gap:10px;grid-template-columns:1
 @media(max-width:699px){.thumb,.icon,.mark{width:96px;height:54px}.signup input[type=email],.signup button{flex:1 1 100%}.legal{gap:10px}}
 footer{color:var(--mut);font-size:.85rem;padding:24px 16px;border-top:1px solid var(--card);margin-top:32px}
 .legal{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 8px}.legal a{color:var(--mut)}
-.notice{margin:0 0 8px}.empty{color:var(--mut);font-style:italic}"""
+.notice{margin:0 0 8px}.empty{color:var(--mut);font-style:italic}
+.faq h3{font-size:1.05rem;margin:1.1em 0 .25em}.faq p{margin:.2em 0 0}"""
 
 LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#18221d"/><ellipse cx="32" cy="38" rx="20" ry="16" fill="#a0703f"/><circle cx="25" cy="34" r="3" fill="#222"/><circle cx="39" cy="34" r="3" fill="#222"/><ellipse cx="32" cy="43" rx="7" ry="4" fill="#6b4423"/><path d="M12 32a20 20 0 0 1 40 0" stroke="#4ade80" stroke-width="5" fill="none"/><rect x="8" y="30" width="7" height="12" rx="3" fill="#4ade80"/><rect x="49" y="30" width="7" height="12" rx="3" fill="#4ade80"/></svg>'
 
@@ -948,6 +1032,162 @@ def free_list(items, n=None):
         inner = f'<h3><a class="out" href="{esc(url)}" rel="{OUTBOUND_REL}">{esc(g["title"])}</a>{label}</h3><p class="meta">{esc(g["platform"])}{worth}{ends} · via {esc(g["source"])}</p>'
         li.append(card(media, inner))
     return '<ul class="cards">' + "".join(li) + "</ul>"
+
+def join_names(items):
+    names = [str(item) for item in items if str(item or "").strip()]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + ", and " + names[-1]
+
+def listed_price(worth):
+    worth = str(worth or "").strip()
+    if worth in ("", "N/A", "0", "$0.00"):
+        return ""
+    return worth
+
+def time_html(iso):
+    iso = str(iso or "")
+    label = ct(iso) if iso and ("+" in iso or "Z" in iso) else ""
+    if not label:
+        return ""
+    return f'<time datetime="{esc(iso)}">{esc(label)}</time>'
+
+def upcoming_mention(items):
+    """One homepage sentence. Empty when Epic has not posted the next giveaway."""
+    if not items:
+        return ""
+    shown = list(items[:4])
+    shared = len({g.get("starts") for g in shown}) == 1 and len({g.get("ends") for g in shown}) == 1
+    bits = []
+    for g in shown:
+        price = listed_price(g.get("worth"))
+        if shared:
+            bits.append(f"{g.get('title') or 'Game'} ({price})" if price else (g.get("title") or "Game"))
+        else:
+            window = " – ".join(part for part in (ct(g.get("starts") or ""), ct(g.get("ends") or "")) if part)
+            detail = ", ".join(part for part in (price, window) if part)
+            bits.append(f"{g.get('title') or 'Game'} ({detail})" if detail else (g.get("title") or "Game"))
+    sentence = join_names(bits)
+    if shared:
+        start_label, end_label = ct(shown[0].get("starts") or ""), ct(shown[0].get("ends") or "")
+        if start_label and end_label:
+            sentence += f", free {start_label} – {end_label}"
+    more = f" Plus {len(items) - len(shown)} more." if len(items) > len(shown) else ""
+    link = esc(href("/free-games/") + "#coming-next")
+    return f'<p>Coming next on Epic: {esc(sentence)}.{more} <a href="{link}">See upcoming free games</a>.</p>'
+
+def upcoming_section(items):
+    """Card list for scheduled Epic giveaways. Omitted entirely when there are none."""
+    if not items:
+        return ""
+    cards = []
+    for g in items:
+        start, end = time_html(g.get("starts")), time_html(g.get("ends"))
+        window = f" · free {start} – {end}" if start and end else ""
+        price = listed_price(g.get("worth"))
+        worth = f" · normally <s>{esc(price)}</s>" if price else ""
+        url, affiliate = with_affiliate(g.get("url"), g.get("platform") or g.get("source") or "")
+        label = '<span class="ad">Affiliate</span>' if affiliate else ""
+        media = media_html(g.get("image"), g.get("title") or "Upcoming game", short_label(g.get("source") or g.get("platform")))
+        inner = f'<h3><a class="out" href="{esc(url)}" rel="{OUTBOUND_REL}">{esc(g.get("title"))}</a>{label}</h3><p class="meta">{esc(g.get("platform") or "")}{worth}{window} · via {esc(g.get("source") or "")}</p>'
+        cards.append(card(media, inner))
+    body = '<ul class="cards">' + "".join(cards) + "</ul>"
+    return ('<section id="coming-next" aria-labelledby="coming-next-title">'
+            '<h2 id="coming-next-title">Coming next on Epic</h2>'
+            '<p>These Epic Games Store games are scheduled to be free to keep. Dates are Central Time.</p>'
+            f'{body}</section>')
+
+def faq_entries(free, upcoming):
+    """Four free-games answers filled from the listings this build just collected."""
+    epic = [g for g in free if g.get("source") == "Epic Games"]
+    if not epic:
+        current_answer = "No Epic Games Store game is free to keep right now. The list refreshes several times a day."
+    else:
+        bits = []
+        for g in epic:
+            price = listed_price(g.get("worth"))
+            bits.append(f"{g['title']} (normally {price})" if price else g["title"])
+        names = join_names(bits)
+        verb = "is" if len(epic) == 1 else "are"
+        ends = [ct(g.get("ends") or "") for g in epic]
+        ends = [label for label in ends if label]
+        if ends and len(set(ends)) == 1:
+            current_answer = f"{names} {verb} free to keep on the Epic Games Store right now. Claim by {ends[0]}."
+        elif ends:
+            deadlines = join_names(
+                f"{g['title']} by {ct(g.get('ends') or '')}" for g in epic if ct(g.get("ends") or "")
+            )
+            current_answer = f"{names} {verb} free to keep on the Epic Games Store right now. Claim {deadlines}."
+        else:
+            current_answer = f"{names} {verb} free to keep on the Epic Games Store right now."
+    if not upcoming:
+        next_answer = "Epic has not announced the next free-to-keep game yet. This page updates several times a day."
+    else:
+        first = upcoming[0]
+        same = [g for g in upcoming if g.get("starts") == first.get("starts") and g.get("ends") == first.get("ends")]
+        rest = [g for g in upcoming if g not in same]
+        names = join_names(g.get("title") or "A game" for g in same)
+        verb = "is" if len(same) == 1 else "are"
+        start, end = ct(first.get("starts") or ""), ct(first.get("ends") or "")
+        next_answer = f"{names} {verb} next, free to keep from {start} until {end}."
+        if rest:
+            later = join_names(
+                f"{g.get('title') or 'A game'} from {ct(g.get('starts') or '')} until {ct(g.get('ends') or '')}" for g in rest
+            )
+            next_answer += f" Also scheduled: {later}."
+    if not epic:
+        claim_answer = "A free Epic game can be claimed only while its promotion is live. End times on this page are Central Time, and the price goes back to normal after that."
+    else:
+        deadlines = [(g["title"], ct(g.get("ends") or "")) for g in epic if ct(g.get("ends") or "")]
+        if len(deadlines) == 1:
+            claim_answer = f"You can claim {deadlines[0][0]} until {deadlines[0][1]}. After that the Epic price goes back to normal, so add it to your library before then."
+        elif deadlines and len({when for _, when in deadlines}) == 1:
+            claim_answer = f"You can claim the current Epic giveaways until {deadlines[0][1]}. After that the price goes back to normal, so add each game to your library before then."
+        elif deadlines:
+            bits = join_names(f"{title} until {when}" for title, when in deadlines)
+            claim_answer = f"Each current Epic giveaway has its own deadline: {bits}. Add the game to your library before its end time, or the price goes back to normal."
+        else:
+            claim_answer = "Claim a free Epic game before the end time shown on its listing. That time is Central Time; after it passes, the price goes back to normal."
+    priced = []
+    for g in list(epic) + list(upcoming):
+        price = listed_price(g.get("worth"))
+        if price:
+            priced.append(f"{g.get('title') or 'A game'} normally costs {price}")
+    if priced:
+        cost_answer = join_names(priced) + ". The giveaway price is free during the dates listed above."
+    else:
+        cost_answer = "Epic did not list a normal price for these games. During each promotion on this page the offer price is free."
+    return [
+        ("What games are free on Epic right now?", current_answer),
+        ("When is the next free Epic game?", next_answer),
+        ("How long do I have to claim a free game?", claim_answer),
+        ("What do these Epic games normally cost?", cost_answer),
+    ]
+
+def faq_section(entries):
+    blocks = "".join(f"<h3>{esc(q)}</h3><p>{esc(a)}</p>" for q, a in entries)
+    return f'<section class="faq" id="faq" aria-labelledby="faq-title"><h2 id="faq-title">Free games FAQ</h2>{blocks}</section>'
+
+def faq_jsonld(entries):
+    return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [
+        {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}
+        for q, a in entries
+    ]}
+
+def llms_upcoming(items):
+    if not items:
+        return "- None scheduled"
+    lines = []
+    for g in items:
+        price = listed_price(g.get("worth"))
+        price_bit = f", normally {price}" if price else ""
+        start, end = ct(g.get("starts") or ""), ct(g.get("ends") or "")
+        lines.append(f"- {g.get('title')} (Epic Games Store{price_bit}): free {start} – {end} — {g.get('url')}")
+    return "\n".join(lines)
 
 def deal_list(items, n=None):
     items = items[:n] if n else items
@@ -1109,22 +1349,24 @@ def write(rel, text):
 def build(offline=False):
     FAILURES.clear()
     now = dt.datetime.now(CT).replace(microsecond=0)
-    free = fetch_epic(offline)
-    norm = lambda t: re.sub(r"\s*\([^)]*\)\s*$", "", t).strip().lower()
-    titles = {norm(g["title"]) for g in free}
-    free += [g for g in fetch_gamerpower(offline) if norm(g["title"]) not in titles]
+    free, upcoming = fetch_epic(offline)
+    titles = {norm_title(g["title"]) for g in free}
+    free += [g for g in fetch_gamerpower(offline) if norm_title(g["title"]) not in titles]
+    upcoming = omit_listed(upcoming, free)
     deals, news = fetch_deals(offline), fetch_news(offline)
     form = signup()
     pages = []
     def P(path, *a, **k): write(path + "index.html", page(path, *a, now, **k)); pages.append(path)
     P("/", f"{C.SITE_NAME}: Free Games, Game Deals & Gaming News Today",
       f"Today's free PC games, the best game deals and the latest gaming news, updated several times a day. {len(free)} free games right now.",
-      f'<h1>Free games, deals and gaming news, updated daily</h1><p>{esc(C.TAGLINE)}</p><h2>Free right now</h2>{free_list(free, 6)}<p><a href="{href("/free-games/")}">All free games →</a></p><h2>Top deals</h2>{deal_list(deals, 6)}<p><a href="{href("/deals/")}">All deals →</a></p><h2>Latest news</h2>{news_list(news, 6)}<p><a href="{href("/news/")}">All news →</a></p>{form}',
+      f'<h1>Free games, deals and gaming news, updated daily</h1><p>{esc(C.TAGLINE)}</p><h2>Free right now</h2>{free_list(free, 6)}{upcoming_mention(upcoming)}<p><a href="{href("/free-games/")}">All free games →</a></p><h2>Top deals</h2>{deal_list(deals, 6)}<p><a href="{href("/deals/")}">All deals →</a></p><h2>Latest news</h2>{news_list(news, 6)}<p><a href="{href("/news/")}">All news →</a></p>{form}',
       jsonld=[itemlist("Free games right now", free[:6])] if free else [])
+    faqs = faq_entries(free, upcoming)
+    free_ld = [itemlist("Free games right now", free)] if free else []
     P("/free-games/", f"Free Games Right Now ({now:%B %Y}) | {C.SITE_NAME}",
       "Every free-to-keep game giveaway we can find on Epic Games Store, Steam, GOG and more, with end dates in Central Time.",
-      f'<h1>Free games right now</h1><p>Games you can claim and keep for free. Data: Epic Games Store and <a href="https://www.gamerpower.com/">GamerPower</a>. Machine-readable: <a href="{href("/data/free-games.json")}">free-games.json</a>.</p>{free_list(free)}{form}',
-      jsonld=[itemlist("Free games right now", free)] if free else [])
+      f'<h1>Free games right now</h1><p>Games you can claim and keep for free. Data: Epic Games Store and <a href="https://www.gamerpower.com/">GamerPower</a>. Machine-readable: <a href="{href("/data/free-games.json")}">free-games.json</a>.</p><section id="free-now">{free_list(free)}</section>{upcoming_section(upcoming)}{faq_section(faqs)}{form}',
+      jsonld=[*free_ld, faq_jsonld(faqs)])
     P("/deals/", f"Best PC Game Deals Today | {C.SITE_NAME}",
       "The highest-rated PC game discounts on Steam, GOG, Humble and Fanatical, with sale prices and savings, refreshed several times a day.",
       f'<h1>Top PC game deals</h1><p>Deal data from <a href="https://www.cheapshark.com/">CheapShark</a>. Prices can change at any time. Machine-readable: <a href="{href("/data/deals.json")}">deals.json</a>.</p>{deal_list(deals)}{form}',
@@ -1187,7 +1429,7 @@ def build(offline=False):
       now))
     write("/style.css", CSS); write("/logo.svg", LOGO_SVG); write_og()
     write("/data/deals.json", json.dumps({"updated": now.isoformat(), "source": "CheapShark", "count": len(deals), "deals": deals}, indent=1, ensure_ascii=False))
-    write("/data/free-games.json", json.dumps({"updated": now.isoformat(), "sources": ["Epic Games Store", "GamerPower"], "count": len(free), "games": free}, indent=1, ensure_ascii=False))
+    write("/data/free-games.json", json.dumps({"updated": now.isoformat(), "sources": ["Epic Games Store", "GamerPower"], "count": len(free), "games": free, "upcoming": upcoming}, indent=1, ensure_ascii=False))
     news_rows = []
     for item in news:
         row = {"title": item.get("title", ""), "source": item.get("source", ""), "url": item.get("url", ""),
@@ -1200,12 +1442,13 @@ def build(offline=False):
     write("/sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
           "".join(f"<url><loc>{C.BASE_URL}{p}</loc><lastmod>{now.isoformat()}</lastmod><changefreq>hourly</changefreq></url>\n" for p in pages) + "</urlset>\n")
     top = "\n".join(f"- {g['title']} ({g['platform']}): {g['url']}" for g in free[:10]) or "- None right now"
+    coming = llms_upcoming(upcoming)
     write("/llms.txt", f"""# {C.SITE_NAME}
 
 > {C.TAGLINE} Run by {C.OPERATOR} (https://x.com/{C.OPERATOR_X}). Updated automatically several times a day; last update {now:%Y-%m-%d %H:%M} CT.
 
 ## Pages
-- [Free games]({C.BASE_URL}/free-games/): current free-to-keep game giveaways with end dates
+- [Free games]({C.BASE_URL}/free-games/): current free-to-keep game giveaways with end dates, plus upcoming Epic free games
 - [Deals]({C.BASE_URL}/deals/): top-rated PC game discounts (CheapShark data)
 - [News]({C.BASE_URL}/news/): headlines with short summaries, linked to original publishers
 - [About]({C.BASE_URL}/about/): operator, automation and affiliate disclosures
@@ -1215,15 +1458,18 @@ def build(offline=False):
 - [Terms]({C.BASE_URL}/terms/): short terms of use
 
 ## Data
-- [free-games.json]({C.BASE_URL}/data/free-games.json): JSON list of current free games
+- [free-games.json]({C.BASE_URL}/data/free-games.json): JSON list of current free games (`games`) and scheduled Epic giveaways (`upcoming`)
 - [deals.json]({C.BASE_URL}/data/deals.json): JSON list of current deals
 - [news.json]({C.BASE_URL}/data/news.json): JSON list of current gaming headlines
 
 ## Free right now
 {top}
+
+## Coming next
+{coming}
 """)
-    write("/build-report.json", json.dumps({"built": now.isoformat(), "free": len(free), "deals": len(deals), "news": len(news), "failures": FAILURES}, indent=1))
-    return {"free": len(free), "deals": len(deals), "news": len(news), "failures": list(FAILURES)}
+    write("/build-report.json", json.dumps({"built": now.isoformat(), "free": len(free), "upcoming": len(upcoming), "deals": len(deals), "news": len(news), "failures": FAILURES}, indent=1))
+    return {"free": len(free), "upcoming": len(upcoming), "deals": len(deals), "news": len(news), "failures": list(FAILURES)}
 
 if __name__ == "__main__":
     print(json.dumps(build("--offline" in sys.argv), indent=1))
