@@ -987,6 +987,7 @@ def page(path, title, desc, body, updated, jsonld=()):
     nav = "".join(f'<a href="{href(h)}"{" aria-current=page" if h == path else ""}>{n}</a>' for h, n in NAV)
     iso = updated.isoformat()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="impact-site-verification" value="16c69e26-fc4d-424f-a478-069c40c6c520">
 <title>{esc(title)}</title><meta name="description" content="{esc(desc)}"><link rel="canonical" href="{url}">
 <meta property="og:type" content="website"><meta property="og:site_name" content="{C.SITE_NAME}"><meta property="og:title" content="{esc(title)}"><meta property="og:description" content="{esc(desc)}"><meta property="og:url" content="{url}"><meta property="og:image" content="{C.BASE_URL}/og.png">
 <meta name="twitter:card" content="summary_large_image"><meta name="twitter:site" content="@{C.X_HANDLE}"><meta name="twitter:title" content="{esc(title)}"><meta name="twitter:description" content="{esc(desc)}"><meta name="twitter:image" content="{C.BASE_URL}/og.png">
