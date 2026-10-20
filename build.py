@@ -1,7 +1,9 @@
 """StazGames static site generator. Usage: python build.py [--offline]"""
 import json, os, re, sys, html, time, datetime as dt
+from email.utils import format_datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from xml.sax.saxutils import escape as xml_escape
 import requests, feedparser
 import config as C
 
@@ -959,6 +961,18 @@ footer{color:var(--mut);font-size:.85rem;padding:24px 16px;border-top:1px solid 
 LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#18221d"/><ellipse cx="32" cy="38" rx="20" ry="16" fill="#a0703f"/><circle cx="25" cy="34" r="3" fill="#222"/><circle cx="39" cy="34" r="3" fill="#222"/><ellipse cx="32" cy="43" rx="7" ry="4" fill="#6b4423"/><path d="M12 32a20 20 0 0 1 40 0" stroke="#4ade80" stroke-width="5" fill="none"/><rect x="8" y="30" width="7" height="12" rx="3" fill="#4ade80"/><rect x="49" y="30" width="7" height="12" rx="3" fill="#4ade80"/></svg>'
 
 NAV = [("/", "Home"), ("/free-games/", "Free games"), ("/deals/", "Deals"), ("/news/", "News"), ("/newsletter/", "Newsletter"), ("/about/", "About")]
+CRUMBS = {
+    "/free-games/": "Free games",
+    "/deals/": "Deals",
+    "/news/": "News",
+    "/newsletter/": "Newsletter",
+    "/about/": "About",
+    "/disclosure/": "Disclosure",
+    "/privacy/": "Privacy",
+    "/contact/": "Contact",
+    "/terms/": "Terms",
+    "/404.html": "Page not found",
+}
 
 def href(path):
     """Root-relative URL, prefixed when BASE_URL has a project path (GitHub Pages).
@@ -977,13 +991,33 @@ def form_action():
         return "https://stazgames.com/api/subscribe"
     return href("/api/subscribe")
 
+def breadcrumb_ld(path):
+    """Home, then this page. The homepage itself has no breadcrumb."""
+    return {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": C.BASE_URL + "/"},
+        {"@type": "ListItem", "position": 2, "name": CRUMBS.get(path) or "Page", "item": C.BASE_URL + path},
+    ]}
+
+def feed_links(path):
+    """News feed on every page. The free-games feed is discovered from that page."""
+    tags = [("/feed.xml", f"{C.SITE_NAME} news")]
+    if path == "/free-games/":
+        tags.append(("/free-games/feed.xml", f"{C.SITE_NAME} free games"))
+    return "".join(
+        f'<link rel="alternate" type="application/rss+xml" href="{href(feed_path)}" title="{esc(label)}">'
+        for feed_path, label in tags
+    )
+
 def page(path, title, desc, body, updated, jsonld=()):
     url = C.BASE_URL + path
     org = {"@context": "https://schema.org", "@type": "Organization", "name": C.SITE_NAME, "url": C.BASE_URL + "/",
            "logo": C.BASE_URL + "/logo.svg", "sameAs": [f"https://x.com/{C.X_HANDLE}"],
            "founder": {"@type": "Person", "name": C.OPERATOR, "sameAs": f"https://x.com/{C.OPERATOR_X}"}}
     site = {"@context": "https://schema.org", "@type": "WebSite", "name": C.SITE_NAME, "url": C.BASE_URL + "/", "description": C.TAGLINE}
-    lds = "".join(f'<script type="application/ld+json">{json.dumps(j, ensure_ascii=False).replace("</", "<\\/")}</script>' for j in (org, site, *jsonld))
+    blocks = [org, site, *jsonld]
+    if path != "/":
+        blocks.append(breadcrumb_ld(path))
+    lds = "".join(f'<script type="application/ld+json">{json.dumps(j, ensure_ascii=False).replace("</", "<\\/")}</script>' for j in blocks)
     nav = "".join(f'<a href="{href(h)}"{" aria-current=page" if h == path else ""}>{n}</a>' for h, n in NAV)
     iso = updated.isoformat()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -991,7 +1025,7 @@ def page(path, title, desc, body, updated, jsonld=()):
 <title>{esc(title)}</title><meta name="description" content="{esc(desc)}"><link rel="canonical" href="{url}">
 <meta property="og:type" content="website"><meta property="og:site_name" content="{C.SITE_NAME}"><meta property="og:title" content="{esc(title)}"><meta property="og:description" content="{esc(desc)}"><meta property="og:url" content="{url}"><meta property="og:image" content="{C.BASE_URL}/og.png">
 <meta name="twitter:card" content="summary_large_image"><meta name="twitter:site" content="@{C.X_HANDLE}"><meta name="twitter:title" content="{esc(title)}"><meta name="twitter:description" content="{esc(desc)}"><meta name="twitter:image" content="{C.BASE_URL}/og.png">
-<link rel="icon" href="{href("/logo.svg")}" type="image/svg+xml"><link rel="alternate" type="text/plain" href="{href("/llms.txt")}" title="LLM summary">
+<link rel="icon" href="{href("/logo.svg")}" type="image/svg+xml"><link rel="alternate" type="text/plain" href="{href("/llms.txt")}" title="LLM summary">{feed_links(path)}
 <link rel="stylesheet" href="{href("/style.css")}">{lds}</head><body>
 <header><a class="logo" href="{href("/")}">Staz<span>Games</span></a><nav aria-label="Main">{nav}</nav></header>
 <main><p class="upd">Updated <time datetime="{iso}">{updated.strftime("%b %d, %Y %I:%M %p")} CT</time></p>{body}</main>
@@ -1343,6 +1377,85 @@ def write_og():
     os.makedirs(C.OUT_DIR, exist_ok=True)
     image.save(os.path.join(C.OUT_DIR, "og.png"), "PNG", optimize=True)
 
+def end_label(ends):
+    """End date as the free-games page shows it."""
+    ends = str(ends or "")
+    if not ends:
+        return ""
+    if "+" in ends or "Z" in ends:
+        return ct(ends) or ends
+    return ends[:10]
+
+def xml_text(value):
+    return xml_escape("" if value is None else str(value))
+
+def xml_attr(value):
+    return xml_escape("" if value is None else str(value), {'"': "&quot;"})
+
+def rss_datetime(value):
+    """RFC 822 timestamp for RSS pubDate and lastBuildDate."""
+    if isinstance(value, dt.datetime):
+        when = value
+    else:
+        when = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return format_datetime(when)
+
+def render_rss(title, link, description, self_url, updated, items):
+    """RSS 2.0. Item links are XML-escaped and otherwise left unchanged."""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">',
+        "<channel>",
+        f"<title>{xml_text(title)}</title>",
+        f"<link>{xml_text(link)}</link>",
+        f"<description>{xml_text(description)}</description>",
+        f"<lastBuildDate>{xml_text(rss_datetime(updated))}</lastBuildDate>",
+        f'<atom:link href="{xml_attr(self_url)}" rel="self" type="application/rss+xml"></atom:link>',
+    ]
+    for item in items:
+        lines.append("<item>")
+        lines.append(f"<title>{xml_text(item.get('title'))}</title>")
+        lines.append(f"<link>{xml_text(item.get('link'))}</link>")
+        if item.get("description"):
+            lines.append(f"<description>{xml_text(item['description'])}</description>")
+        if item.get("pubDate"):
+            lines.append(f"<pubDate>{xml_text(item['pubDate'])}</pubDate>")
+        if item.get("link"):
+            lines.append(f'<guid isPermaLink="true">{xml_text(item["link"])}</guid>')
+        lines.append("</item>")
+    lines.extend(["</channel>", "</rss>", ""])
+    return "\n".join(lines)
+
+def news_rss_items(news):
+    """Headlines for /feed.xml. The description is the summary already published on the site."""
+    items = []
+    for item in news:
+        row = {"title": item.get("title") or "", "link": item.get("url") or ""}
+        summary = voice_blurb(item.get("title"), item.get("summary"), item.get("source"))
+        if summary:
+            row["description"] = summary
+        if item.get("published"):
+            try:
+                row["pubDate"] = rss_datetime(item["published"])
+            except Exception:
+                pass
+        items.append(row)
+    return items
+
+def free_rss_items(games):
+    """Current free-to-keep games. Store links match the free-games page, including affiliate tags."""
+    items = []
+    for game in games:
+        link, _active = with_affiliate(game.get("url"), game.get("platform") or game.get("source") or "")
+        row = {"title": game.get("title") or "", "link": link}
+        label = end_label(game.get("ends"))
+        if label:
+            row["description"] = f"Ends {label}."
+        items.append(row)
+    return items
+
 def write(rel, text):
     p = os.path.join(C.OUT_DIR, rel.lstrip("/")); os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     open(p, "w", encoding="utf-8").write(text)
@@ -1439,6 +1552,22 @@ def build(offline=False):
             row["published"] = item["published"]
         news_rows.append(row)
     write("/data/news.json", json.dumps({"updated": now.isoformat(), "count": len(news_rows), "news": news_rows}, indent=1, ensure_ascii=False))
+    write("/feed.xml", render_rss(
+        f"{C.SITE_NAME} gaming news",
+        C.BASE_URL + "/news/",
+        "Gaming headlines with a short summary and a link to the original publisher.",
+        C.BASE_URL + "/feed.xml",
+        now,
+        news_rss_items(news),
+    ))
+    write("/free-games/feed.xml", render_rss(
+        f"{C.SITE_NAME} free games",
+        C.BASE_URL + "/free-games/",
+        "Current free-to-keep games with the end date of each giveaway.",
+        C.BASE_URL + "/free-games/feed.xml",
+        now,
+        free_rss_items(free),
+    ))
     write("/robots.txt", f"User-agent: *\nAllow: {href("/")}\n\nSitemap: {C.BASE_URL}/sitemap.xml\n")
     write("/sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
           "".join(f"<url><loc>{C.BASE_URL}{p}</loc><lastmod>{now.isoformat()}</lastmod><changefreq>hourly</changefreq></url>\n" for p in pages) + "</urlset>\n")
@@ -1462,6 +1591,8 @@ def build(offline=False):
 - [free-games.json]({C.BASE_URL}/data/free-games.json): JSON list of current free games (`games`) and scheduled Epic giveaways (`upcoming`)
 - [deals.json]({C.BASE_URL}/data/deals.json): JSON list of current deals
 - [news.json]({C.BASE_URL}/data/news.json): JSON list of current gaming headlines
+- [feed.xml]({C.BASE_URL}/feed.xml): RSS 2.0 feed of gaming news headlines
+- [free-games/feed.xml]({C.BASE_URL}/free-games/feed.xml): RSS 2.0 feed of current free-to-keep games
 
 ## Free right now
 {top}
