@@ -58,6 +58,86 @@ def html_pages(out):
             pages[path] = open(full, encoding="utf-8").read()
     return pages
 
+ATOM_LINK = "{http://www.w3.org/2005/Atom}link"
+
+def check_rss(path, self_url, channel_link, expected, html):
+    check(os.path.isfile(path), f"missing feed {path}")
+    if not os.path.isfile(path):
+        return
+    try:
+        root = ET.parse(path).getroot()
+    except Exception as exc:
+        check(False, f"{path} XML parse error {exc}")
+        return
+    check(root.tag == "rss" and root.get("version") == "2.0", f"{path} not RSS 2.0")
+    channel = root.find("channel")
+    check(channel is not None, f"{path} missing channel")
+    if channel is None:
+        return
+    title, link, description = channel.findtext("title"), channel.findtext("link"), channel.findtext("description")
+    check(bool(title) and C.SITE_NAME in title, f"{path} channel title {title}")
+    check(link == channel_link, f"{path} channel link {link}")
+    check(bool(description), f"{path} missing channel description")
+    built = channel.findtext("lastBuildDate")
+    try:
+        from email.utils import parsedate_to_datetime
+        parsedate_to_datetime(built)
+    except Exception as exc:
+        check(False, f"{path} lastBuildDate {built} {exc}")
+    self_links = [el for el in channel.findall(ATOM_LINK) if el.get("rel") == "self"]
+    check(len(self_links) == 1, f"{path} atom:link self count {len(self_links)}")
+    if self_links:
+        check(self_links[0].get("href") == self_url, f"{path} self href {self_links[0].get('href')}")
+        check(self_links[0].get("type") == "application/rss+xml", f"{path} self type")
+    items = channel.findall("item")
+    check(len(items) == len(expected), f"{path} item count {len(items)} vs {len(expected)}")
+    if expected:
+        check(bool(items), f"{path} has no items")
+    for el, want in zip(items, expected):
+        check(el.findtext("title") == want["title"], f"{path} title {el.findtext('title')!r}")
+        check(el.findtext("link") == want["link"], f"{path} link changed {el.findtext('link')!r}")
+        if want["link"]:
+            check(f'href="{build.esc(want["link"])}"' in html, f"{path} feed link missing on the page {want['link']}")
+            guid = el.find("guid")
+            check(guid is not None and guid.text == want["link"] and guid.get("isPermaLink") == "true", f"{path} guid {want['link']}")
+        if want.get("description"):
+            check(el.findtext("description") == want["description"], f"{path} description mismatch for {want['title']}")
+        else:
+            check(not el.findtext("description"), f"{path} unexpected description for {want['title']}")
+        if want.get("pubDate"):
+            check(el.findtext("pubDate") == want["pubDate"], f"{path} pubDate {el.findtext('pubDate')}")
+        else:
+            check(el.findtext("pubDate") is None, f"{path} unexpected pubDate for {want['title']}")
+
+def check_feeds(out, pages, free_doc, news_doc):
+    news_expected = []
+    for item in news_doc.get("news") or []:
+        row = {"title": item.get("title") or "", "link": item.get("url") or ""}
+        if item.get("summary"):
+            row["description"] = item["summary"]
+        if item.get("published"):
+            try:
+                row["pubDate"] = build.rss_datetime(item["published"])
+            except Exception:
+                pass
+        news_expected.append(row)
+    free_expected = []
+    for game in free_doc.get("games") or []:
+        link, _active = build.with_affiliate(game.get("url"), game.get("platform") or game.get("source") or "")
+        row = {"title": game.get("title") or "", "link": link}
+        label = build.end_label(game.get("ends"))
+        if label:
+            row["description"] = f"Ends {label}."
+        free_expected.append(row)
+    check_rss(os.path.join(out, "feed.xml"), C.BASE_URL + "/feed.xml", C.BASE_URL + "/news/", news_expected, pages.get("/news/", ""))
+    check_rss(
+        os.path.join(out, "free-games", "feed.xml"),
+        C.BASE_URL + "/free-games/feed.xml",
+        C.BASE_URL + "/free-games/",
+        free_expected,
+        pages.get("/free-games/", ""),
+    )
+
 def validate(out, external=False):
     pages = html_pages(out)
     for req in ["/", "/free-games/", "/deals/", "/news/", "/about/", "/newsletter/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/404.html"]: check(req in pages, f"missing page {req}")
@@ -130,6 +210,26 @@ def validate(out, external=False):
                 types.add(j["@type"])
             except Exception as e: ERR.append(f"{path}: invalid JSON-LD {e}")
         check({"Organization","WebSite"} <= types, f"{path}: missing Org/WebSite JSON-LD")
+        rss = [a.get("href") for a in p.tags.get("link", []) if a.get("rel") == "alternate" and a.get("type") == "application/rss+xml"]
+        check(rss.count(build.href("/feed.xml")) == 1, f"{path}: news feed link {rss}")
+        if path == "/free-games/":
+            check(rss.count(build.href("/free-games/feed.xml")) == 1, f"{path}: free-games feed link {rss}")
+        else:
+            check(build.href("/free-games/feed.xml") not in rss, f"{path}: free-games feed link {rss}")
+        crumbs = [j for j in docs if j.get("@type") == "BreadcrumbList"]
+        if path == "/":
+            check(not crumbs, f"{path}: homepage BreadcrumbList")
+        else:
+            check(len(crumbs) == 1, f"{path}: expected one BreadcrumbList, got {len(crumbs)}")
+            elements = (crumbs[0].get("itemListElement") if crumbs else None) or []
+            check(bool(crumbs) and crumbs[0].get("@context") == "https://schema.org", f"{path}: breadcrumb context")
+            check(len(elements) == 2, f"{path}: breadcrumb length {len(elements)}")
+            home_crumb = elements[0] if elements else {}
+            page_crumb = elements[1] if len(elements) > 1 else {}
+            check(home_crumb.get("@type") == "ListItem" and home_crumb.get("position") == 1, f"{path}: breadcrumb home position")
+            check(home_crumb.get("name") == "Home" and home_crumb.get("item") == C.BASE_URL + "/", f"{path}: breadcrumb home {home_crumb}")
+            check(page_crumb.get("@type") == "ListItem" and page_crumb.get("position") == 2, f"{path}: breadcrumb page position")
+            check(page_crumb.get("name") == build.CRUMBS.get(path) and page_crumb.get("item") == C.BASE_URL + path, f"{path}: breadcrumb page {page_crumb}")
         def check_itemlist(card_h3, price_kind):
             lists = [j for j in docs if j.get("@type") == "ItemList"]
             check(len(lists) == 1, f"{path}: expected one ItemList, got {len(lists)}")
@@ -239,6 +339,7 @@ def validate(out, external=False):
     locs = {e.text for e in sm.iter("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")}
     indexed = {p for p in pages if p != "/404.html"}
     check(locs == {C.BASE_URL+p for p in indexed}, f"sitemap mismatch: {locs ^ {C.BASE_URL+p for p in indexed}}")
+    check(not any("feed.xml" in (loc or "") for loc in locs), f"sitemap includes a feed: {sorted(locs)}")
     check(C.BASE_URL + "/404.html" not in locs, "404 should not be in the sitemap")
     rb = open(os.path.join(out,"robots.txt")).read()
     check(f"Sitemap: {C.BASE_URL}/sitemap.xml" in rb, "robots.txt missing sitemap")
@@ -279,8 +380,11 @@ def validate(out, external=False):
             check(build._norm_text(summary) != build._norm_text(item.get("title") or ""), f"news summary pastes the headline: {summary}")
     llms = open(os.path.join(out,"llms.txt")).read()
     check(llms.startswith("# "), "llms.txt malformed")
-    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json"):
+    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json", "/feed.xml", "/free-games/feed.xml"):
         check(C.BASE_URL + frag in llms, f"llms.txt missing {C.BASE_URL}{frag}")
+    data = llms.split("## Data", 1)[-1].split("\n## ", 1)[0]
+    check(C.BASE_URL + "/feed.xml" in data and C.BASE_URL + "/free-games/feed.xml" in data, "llms.txt Data section missing feeds")
+    check_feeds(out, pages, free_doc, news_doc)
     check("## Coming next" in llms, "llms.txt missing Coming next")
     coming_txt = llms.split("## Coming next", 1)[-1]
     if free_doc.get("upcoming"):
@@ -750,6 +854,111 @@ def test_epic_upcoming_and_faq():
     finally:
         build.FAILURES.clear()
 
+def test_rss_and_breadcrumbs():
+    import datetime as dt
+    updated = dt.datetime(2026, 10, 20, 8, 17, tzinfo=build.CT)
+    news = [{
+        "title": "Rock & Roll <News>",
+        "source": "IGN",
+        "url": "https://www.ign.com/articles/rock?a=1&b=2",
+        "published": "2026-10-20T15:00:00+00:00",
+        "summary": "Publisher has revealed a loud new album for the first time.",
+    }, {
+        "title": "No date",
+        "source": "VGC",
+        "url": "https://www.videogameschronicle.com/news/no-date/",
+        "summary": "",
+    }]
+    root = ET.fromstring(build.render_rss(
+        f"{C.SITE_NAME} gaming news",
+        C.BASE_URL + "/news/",
+        "Gaming headlines with a short summary and a link to the original publisher.",
+        C.BASE_URL + "/feed.xml",
+        updated,
+        build.news_rss_items(news),
+    ))
+    channel = root.find("channel")
+    items = channel.findall("item")
+    check(root.tag == "rss" and root.get("version") == "2.0", "unit news feed is not RSS 2.0")
+    check(len(items) == 2, f"unit news feed item count {len(items)}")
+    check(items[0].findtext("title") == news[0]["title"], f"news title escaped wrong {items[0].findtext('title')}")
+    check(items[0].findtext("link") == news[0]["url"] and items[0].findtext("guid") == news[0]["url"], f"news link altered {items[0].findtext('link')}")
+    blurb = build.voice_blurb(news[0]["title"], news[0]["summary"], news[0]["source"])
+    check(bool(blurb) and items[0].findtext("description") == blurb, f"news description {items[0].findtext('description')}")
+    check(items[0].findtext("pubDate") == build.rss_datetime(news[0]["published"]), f"news pubDate {items[0].findtext('pubDate')}")
+    check(items[1].findtext("link") == news[1]["url"], "second news link altered")
+    check(items[1].findtext("pubDate") is None and items[1].findtext("description") is None, "empty news summary gained a date or description")
+    self_link = channel.find(ATOM_LINK)
+    check(self_link is not None and self_link.get("rel") == "self" and self_link.get("type") == "application/rss+xml", "news atom self")
+    check(self_link is not None and self_link.get("href") == C.BASE_URL + "/feed.xml", "news self href")
+    check(channel.findtext("link") == C.BASE_URL + "/news/" and channel.findtext("lastBuildDate"), "news channel fields")
+    saved = {k: dict(v) for k, v in C.AFFILIATES.items()}
+    try:
+        C.AFFILIATES["humble"] = {"partner": "staz-humble"}
+        games = [{
+            "title": "Widget",
+            "platform": "Humble Store",
+            "source": "Humble",
+            "url": "https://www.humblebundle.com/store/widget?x=1",
+            "worth": "$5.00",
+            "ends": "2026-10-22T15:00:00+00:00",
+            "image": "",
+        }, {
+            "title": "Redirected",
+            "platform": "Humble Store",
+            "source": "Humble",
+            "url": "https://www.cheapshark.com/redirect?dealID=abc",
+            "worth": "",
+            "ends": "2026-10-31T23:59:00",
+            "image": "",
+        }, {
+            "title": "No End",
+            "platform": "Epic Games Store",
+            "source": "Epic Games",
+            "url": "https://store.epicgames.com/en-US/p/no-end",
+            "worth": "",
+            "ends": "",
+            "image": "",
+        }]
+        free_items = ET.fromstring(build.render_rss(
+            f"{C.SITE_NAME} free games",
+            C.BASE_URL + "/free-games/",
+            "Current free-to-keep games with the end date of each giveaway.",
+            C.BASE_URL + "/free-games/feed.xml",
+            updated,
+            build.free_rss_items(games),
+        )).find("channel").findall("item")
+        humble_link, active = build.with_affiliate(games[0]["url"], games[0]["platform"])
+        check(active and "partner=staz-humble" in humble_link and free_items[0].findtext("link") == humble_link, f"affiliate link {free_items[0].findtext('link')}")
+        check(free_items[0].findtext("description") == "Ends Oct 22, 10:00 AM CT.", f"end date description {free_items[0].findtext('description')}")
+        check(free_items[1].findtext("link") == "https://www.cheapshark.com/redirect?dealID=abc" and "partner=" not in free_items[1].findtext("link"), f"cheapshark altered {free_items[1].findtext('link')}")
+        check(free_items[1].findtext("description") == "Ends 2026-10-31.", f"plain end date {free_items[1].findtext('description')}")
+        check(free_items[2].findtext("link") == games[2]["url"] and free_items[2].findtext("description") is None, "undated free game changed")
+    finally:
+        C.AFFILIATES.clear()
+        C.AFFILIATES.update(saved)
+    home = build.page("/", "Home title unique", "Home description unique.", "<h1>Home</h1>", updated)
+    deals = build.page("/deals/", "Deals title unique", "Deals description unique.", "<h1>Deals</h1>", updated)
+    free_page = build.page("/free-games/", "Free title unique", "Free description unique.", "<h1>Free</h1>", updated)
+    home_types = {j.get("@type") for j in jsonld_docs(home)}
+    deal_docs = jsonld_docs(deals)
+    check(home_types == {"Organization", "WebSite"}, f"home JSON-LD {home_types}")
+    check('rel="alternate" type="application/rss+xml"' in home and build.href("/feed.xml") in home, "home news feed link")
+    check(build.href("/free-games/feed.xml") not in home, "home advertises the free-games feed")
+    check('name="impact-site-verification" value="16c69e26-fc4d-424f-a478-069c40c6c520"' in home, "impact verification tag")
+    crumbs = [j for j in deal_docs if j.get("@type") == "BreadcrumbList"]
+    check({"Organization", "WebSite"} <= {j.get("@type") for j in deal_docs} and len(crumbs) == 1, "deals JSON-LD lost or duplicated")
+    elements = crumbs[0]["itemListElement"] if crumbs else []
+    check(len(elements) == 2 and elements[0]["name"] == "Home" and elements[1]["name"] == "Deals", f"deals breadcrumb {elements}")
+    check(elements and elements[1]["item"] == C.BASE_URL + "/deals/", f"deals breadcrumb url {elements}")
+    check(build.href("/feed.xml") in deals and build.href("/free-games/feed.xml") not in deals, "deals feed links")
+    free_crumbs = [j for j in jsonld_docs(free_page) if j.get("@type") == "BreadcrumbList"]
+    check(len(free_crumbs) == 1 and free_crumbs[0]["itemListElement"][1]["name"] == "Free games", "free-games breadcrumb")
+    check(build.href("/feed.xml") in free_page and build.href("/free-games/feed.xml") in free_page, "free-games feed links")
+
+def jsonld_docs(src):
+    return [json.loads(raw) for raw in re.findall(r'<script type="application/ld\+json">(.*?)</script>', src)]
+
 def test_static_config():
     import subprocess
     vercel = json.load(open("vercel.json", encoding="utf-8"))
@@ -775,6 +984,7 @@ if __name__ == "__main__":
     test_cheapshark_retry()
     test_epic_upcoming_and_faq()
     test_static_config()
+    test_rss_and_breadcrumbs()
     n, e = validate(C.OUT_DIR, external="--external" in sys.argv)
     print(f"live build: {n} pages, {e} external links {'checked' if '--external' in sys.argv else 'found'}")
     # empty-feed fallback: build to temp dir with all feeds disabled

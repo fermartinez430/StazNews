@@ -1,6 +1,6 @@
 # StazGames
 
-Static site for [StazGames](https://stazgames.com): gaming news, free games, and deals. `build.py` pulls public feeds and writes HTML, JSON, `sitemap.xml`, `robots.txt`, `llms.txt`, and `og.png` into `public/`.
+Static site for [StazGames](https://stazgames.com): gaming news, free games, and deals. `build.py` pulls public feeds and writes HTML, JSON, RSS (`feed.xml` and `free-games/feed.xml`), `sitemap.xml`, `robots.txt`, `llms.txt`, and `og.png` into `public/`.
 
 The primary site is `https://stazgames.com` on Vercel. GitHub Pages is a secondary copy at `https://fermartinez430.github.io/StazNews`. Set `BASE_URL` (no trailing slash) to change the public URL. It defaults to `https://stazgames.com`.
 
