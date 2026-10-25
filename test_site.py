@@ -350,8 +350,11 @@ def validate(out, external=False):
     free_doc = json.load(open(os.path.join(out, "data", "free-games.json"), encoding="utf-8"))
     check(isinstance(free_doc.get("upcoming"), list), "free-games.json upcoming missing")
     game_keys = {"title", "platform", "source", "url", "worth", "ends", "image"}
+    built_at = build.dt.datetime.fromisoformat(free_doc["updated"])
     for g in free_doc["games"]:
         check(set(g) == game_keys, f"free game shape changed {sorted(set(g) ^ game_keys)} on {g.get('title')}")
+        if g.get("source") == "GamerPower" and g.get("ends"):
+            check(not build.gamerpower_ended(g["ends"], built_at), f"expired GamerPower giveaway {g.get('title')} ends {g.get('ends')}")
     for g in free_doc["upcoming"]:
         check(set(g) == game_keys | {"starts"}, f"upcoming shape {sorted(set(g))} on {g.get('title')}")
         check(g.get("source") == "Epic Games" and g.get("platform") == "Epic Games Store", f"upcoming source {g.get('title')}")
@@ -959,6 +962,79 @@ def test_rss_and_breadcrumbs():
 def jsonld_docs(src):
     return [json.loads(raw) for raw in re.findall(r'<script type="application/ld\+json">(.*?)</script>', src)]
 
+def test_gamerpower_expiry():
+    import datetime as dt
+    # 2026-10-25 06:23 CT, when the live feed still listed these two.
+    built = dt.datetime(2026, 10, 25, 11, 23, tzinfo=dt.timezone.utc)
+    check(build.gamerpower_ended("2026-10-24T23:59:59", built), "The Black Within still open after its UTC end")
+    check(build.gamerpower_ended("2026-10-24T23:59:00", built), "Castlevania still open after its UTC end")
+    # 02:00 UTC is still before 23:59 US Eastern, and the UTC reading drops it anyway.
+    between = dt.datetime(2026, 10, 25, 2, 0, tzinfo=dt.timezone.utc)
+    check(build.gamerpower_ended("2026-10-24T23:59:59", between), "UTC end kept until US Eastern")
+    exact = dt.datetime(2026, 10, 24, 23, 59, 59, tzinfo=dt.timezone.utc)
+    check(not build.gamerpower_ended("2026-10-24T23:59:59", exact), "dropped at the end instant")
+    check(build.gamerpower_ended("2026-10-24T23:59:59", exact + dt.timedelta(seconds=1)), "kept one second after the end")
+    check(not build.gamerpower_ended("", built) and not build.gamerpower_ended("N/A", built), "blank or N/A end treated as expired")
+    check(not build.gamerpower_ended("soon", built), "unparsed end treated as expired")
+    check(not build.gamerpower_ended("2026-11-01T23:59:00", built), "future end treated as expired")
+
+    rows = [
+        {"title": "The Black Within (itch.io) Giveaway", "platforms": "PC, Itch.io", "worth": "$4.99",
+         "open_giveaway_url": "https://example.com/black", "end_date": "2026-10-24 23:59:59",
+         "thumbnail": "https://example.com/black.jpg"},
+        {"title": "Castlevania: 40th Anniversary (Mobile) Giveaway", "platforms": "Android, iOS", "worth": "N/A",
+         "open_giveaway_url": "https://example.com/castlevania", "end_date": "2026-10-24 23:59:00",
+         "thumbnail": ""},
+        {"title": "Last Room (IndieGala) Giveaway", "platforms": "PC, DRM-Free", "worth": "N/A",
+         "gamerpower_url": "https://example.com/last", "end_date": "N/A", "image": "https://example.com/last.jpg"},
+        {"title": "MAFIA HOTEL (Epic Games) Giveaway", "platforms": "PC, Epic Games Store", "worth": "$19.99",
+         "open_giveaway_url": "https://example.com/mafia", "end_date": "2026-11-01 23:59:00",
+         "thumbnail": "https://example.com/mafia.jpg"},
+        {"title": "Mystery End Giveaway", "platforms": "PC", "worth": "$1.00",
+         "open_giveaway_url": "https://example.com/mystery", "end_date": "whenever", "thumbnail": ""},
+    ]
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+        def json(self):
+            return self.payload
+
+    old_get = build.get
+    try:
+        build.get = lambda url, timeout=20, attempts=1, backoff=2: Response(rows)
+        build.FAILURES.clear()
+        kept = build.fetch_gamerpower(now=built)
+        titles = [g["title"] for g in kept]
+        check(titles == ["Last Room (IndieGala)", "MAFIA HOTEL (Epic Games)", "Mystery End"], f"filtered titles {titles}")
+        by = {g["title"]: g for g in kept}
+        hotel = by["MAFIA HOTEL (Epic Games)"]
+        check(hotel["ends"] == "2026-11-01T23:59:00" and "+" not in hotel["ends"] and not hotel["ends"].endswith("Z"), f"ends rewritten {hotel['ends']}")
+        check(set(hotel) == {"title", "platform", "source", "url", "worth", "ends", "image"}, f"shape changed {sorted(hotel)}")
+        check(hotel["source"] == "GamerPower" and hotel["platform"] == "PC, Epic Games Store" and hotel["worth"] == "$19.99", f"open giveaway fields changed {hotel}")
+        check(hotel["url"] == "https://example.com/mafia", f"url changed {hotel['url']}")
+        room = by["Last Room (IndieGala)"]
+        check(room["ends"] == "" and room["url"] == "https://example.com/last" and room["worth"] == "N/A", f"undated giveaway changed {room}")
+        check(by["Mystery End"]["ends"] == "whenever", f"unparsed end rewritten {by['Mystery End']['ends']}")
+        published = build.free_list(kept) + json.dumps(build.free_rss_items(kept)) + json.dumps(build.itemlist("Free games right now", kept))
+        check("The Black Within" not in published and "Castlevania" not in published, "expired giveaway reached the page, feed, or structured data")
+        check("MAFIA HOTEL" in published and "Last Room" in published and "Mystery End" in published, "open giveaway missing from published listings")
+        wider = [{"title": f"Game {i} Giveaway", "platforms": "PC", "worth": "$1",
+                  "open_giveaway_url": f"https://example.com/{i}",
+                  "end_date": "2026-10-24 23:59:59" if i == 0 else "2026-11-01 23:59:00",
+                  "thumbnail": ""} for i in range(31)]
+        build.get = lambda url, timeout=20, attempts=1, backoff=2: Response(wider)
+        capped = [g["title"] for g in build.fetch_gamerpower(now=built)]
+        check(capped == [f"Game {i}" for i in range(1, 30)] and "Game 30" not in capped, f"window changed {capped}")
+        build.get = lambda url, timeout=20, attempts=1, backoff=2: Response({"status": 0})
+        build.FAILURES.clear()
+        check(build.fetch_gamerpower(now=built) == [], "bad payload returned rows")
+        check(any(item.startswith("gamerpower parse:") for item in build.FAILURES), f"bad payload not recorded {build.FAILURES}")
+    finally:
+        build.get = old_get
+        build.FAILURES.clear()
+    check(build.fetch_gamerpower(offline=True) == [], "offline gamerpower changed")
+
 def test_static_config():
     import subprocess
     vercel = json.load(open("vercel.json", encoding="utf-8"))
@@ -977,6 +1053,7 @@ def test_static_config():
 
 if __name__ == "__main__":
     test_summaries()
+    test_gamerpower_expiry()
     test_cards()
     test_voice_and_itemlist()
     test_affiliates()
