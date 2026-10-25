@@ -865,17 +865,44 @@ def omit_listed(upcoming, listed):
     have = {norm_title(g.get("title")) for g in listed}
     return [g for g in upcoming if norm_title(g.get("title")) not in have]
 
-def fetch_gamerpower(offline=False):
+def gamerpower_ended(ends, now):
+    """True when a GamerPower end_date has passed.
+
+    The field has no timezone. The clock time is read as UTC. That is the
+    same assumption rss_datetime uses for a naive timestamp, and it is earlier
+    than the same clock time in US Eastern, so the giveaway is dropped once
+    that UTC instant passes and is not still listed after a US end. A blank
+    value stays open. A value that is not a datetime stays open too, which is
+    how an unreadable end was published before this check. The end instant
+    itself is still open, matching the Epic window.
+    """
+    if not ends:
+        return False
+    try:
+        end = dt.datetime.fromisoformat(str(ends).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    return now > end
+
+def fetch_gamerpower(offline=False, now=None):
     if offline: return []
     r = get("https://www.gamerpower.com/api/giveaways?type=game")
     out = []
     if not r: return out
     try:
+        now = now or dt.datetime.now(dt.timezone.utc)
         for g in r.json()[:30]:
             end = g.get("end_date")
+            ends = "" if not end or end == "N/A" else end.replace(" ", "T")
+            if gamerpower_ended(ends, now):
+                continue
             out.append({"title": g["title"].replace(" Giveaway", ""), "platform": g.get("platforms", ""), "source": "GamerPower",
                 "url": g.get("open_giveaway_url") or g.get("gamerpower_url"), "worth": g.get("worth", ""),
-                "ends": "" if not end or end == "N/A" else end.replace(" ", "T"),
+                "ends": ends,
                 "image": safe_img(g.get("thumbnail") or g.get("image"))})
     except Exception as e: FAILURES.append(f"gamerpower parse: {e}")
     return out
