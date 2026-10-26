@@ -708,6 +708,108 @@ def test_cheapshark_retry():
         build.time.sleep = old_sleep
         build.FAILURES.clear()
 
+def test_direct_deal_urls():
+    check(build.steam_app_id("1145360") == "1145360", "steam app id")
+    check(build.steam_app_id(1145360) == "1145360", "numeric steam app id")
+    check(build.steam_app_id("0") == "" and build.steam_app_id(None) == "" and build.steam_app_id("abc") == "", "bad steam app id")
+    check(build.store_title_tokens("Deus Ex: Human Revolution - Director\u2019s Cut") == build.store_title_tokens("Deus Ex: Human Revolution - Director's Cut"), "apostrophe title")
+    check(build.store_title_tokens("BATTLETECH - Mercenary Collection") == build.store_title_tokens("BATTLETECH Mercenary Collection"), "hyphen title")
+    check(build.store_title_tokens("Anomaly: Warzone Earth") == build.store_title_tokens("Anomaly Warzone Earth"), "colon title")
+    check(build.store_title_tokens("GRAVEN") != build.store_title_tokens("The Grave Deal"), "different title matched")
+    check(build.store_title_tokens("X-COM") != build.store_title_tokens("XCOM"), "hyphen split a different title")
+    steam = {"title": "Hades", "storeID": "1", "dealID": "abc", "steamAppID": "1145360"}
+    check(build.direct_store_url(steam, "Steam") == "https://store.steampowered.com/app/1145360/", "steam deal url")
+    check("partner=" not in build.direct_store_url(steam, "Steam") and "?" not in build.direct_store_url(steam, "Steam"), "steam url gained a query")
+    missing = build.direct_store_url({**steam, "steamAppID": None}, "Steam")
+    check(missing == "https://www.cheapshark.com/redirect?dealID=abc", f"steam without app id {missing}")
+    unnamed = build.direct_store_url(steam, "Store 1")
+    check(unnamed == "https://www.cheapshark.com/redirect?dealID=abc", f"unknown store name used steam id {unnamed}")
+    epic = build.direct_store_url({"title": "Squad", "storeID": "25", "dealID": "epic1", "steamAppID": "315210"}, "Epic Games Store")
+    humble = build.direct_store_url({"title": "Hades", "storeID": "11", "dealID": "h1", "steamAppID": "1145360"}, "Humble Store")
+    check(epic == "https://www.cheapshark.com/redirect?dealID=epic1", f"epic sent to steam {epic}")
+    check(humble == "https://www.cheapshark.com/redirect?dealID=h1" and "steampowered" not in humble, f"humble sent to steam {humble}")
+    card = build.deal_list([{
+        "title": "Hades", "store": "Steam", "price": "4.99", "normal": "24.99", "savings": 80,
+        "metacritic": "93", "url": "https://store.steampowered.com/app/1145360/",
+        "image": "", "icon": "",
+    }])
+    check("at Steam" in card and 'href="https://store.steampowered.com/app/1145360/"' in card, f"store name or steam link missing {card}")
+    check("partner=" not in card and "tag=" not in card and 'class="ad"' not in card, f"direct steam link tagged {card}")
+    plain, active = build.with_affiliate("https://www.gog.com/en/game/rogue_legacy", "GOG")
+    check(plain == "https://www.gog.com/en/game/rogue_legacy" and active is False, f"gog affiliate {plain} {active}")
+    check(build.gog_page_url("https://www.gog.com/en/game/rogue_legacy?utm=1") == "https://www.gog.com/en/game/rogue_legacy", "gog query kept")
+    check(build.gog_page_url("https://evil.example/en/game/rogue_legacy") == "", "non-gog host accepted")
+
+    class Response:
+        def __init__(self, url):
+            self.url = url
+        def raise_for_status(self):
+            return None
+        def json(self):
+            if self.url.endswith("/stores"):
+                return [
+                    {"storeID": "1", "storeName": "Steam", "images": {}},
+                    {"storeID": "7", "storeName": "GOG", "images": {}},
+                    {"storeID": "11", "storeName": "Humble Store", "images": {}},
+                    {"storeID": "25", "storeName": "Epic Games Store", "images": {}},
+                ]
+            if "catalog.gog.com" in self.url:
+                if "Ambiguous" in self.url:
+                    return {"products": [
+                        {"title": "Ambiguous", "storeLink": "https://www.gog.com/en/game/one"},
+                        {"title": "Ambiguous", "storeLink": "https://www.gog.com/en/game/two"},
+                    ]}
+                if "Missing" in self.url:
+                    return {"products": [{"title": "Other Game", "storeLink": "https://www.gog.com/en/game/other"}]}
+                return {"products": [
+                    {"title": "Rogue Legacy", "storeLink": "https://www.gog.com/en/game/rogue_legacy?utm=keep"},
+                    {"title": "Rogue Legacy 2", "storeLink": "https://www.gog.com/game/rogue_legacy_2"},
+                ]}
+            return [
+                {"title": "Hades", "storeID": "1", "salePrice": "4.99", "normalPrice": "24.99",
+                 "savings": "80", "metacriticScore": "93", "dealID": "steamdeal", "thumb": "",
+                 "steamAppID": "1145360"},
+                {"title": "Rogue Legacy", "storeID": "7", "salePrice": "1.49", "normalPrice": "14.99",
+                 "savings": "90", "metacriticScore": "85", "dealID": "gogdeal", "thumb": "",
+                 "steamAppID": "241600"},
+                {"title": "Squad", "storeID": "25", "salePrice": "3.49", "normalPrice": "69.99",
+                 "savings": "95", "metacriticScore": "63", "dealID": "epicdeal", "thumb": "",
+                 "steamAppID": "315210"},
+                {"title": "No App", "storeID": "1", "salePrice": "1.00", "normalPrice": "2.00",
+                 "savings": "50", "metacriticScore": "0", "dealID": "noapp", "thumb": "",
+                 "steamAppID": None},
+            ]
+
+    calls = []
+
+    def fake(url, headers=None, timeout=None):
+        calls.append((url, headers, timeout))
+        if "Broken" in url:
+            raise requests.Timeout("catalog down")
+        return Response(url)
+
+    old_get = build.requests.get
+    try:
+        build.requests.get = fake
+        build.FAILURES.clear()
+        deals = build.fetch_deals()
+        by = {d["title"]: d for d in deals}
+        check(by["Hades"]["store"] == "Steam" and by["Hades"]["url"] == "https://store.steampowered.com/app/1145360/", f"fetched steam {by.get('Hades')}")
+        check(by["Rogue Legacy"]["store"] == "GOG" and by["Rogue Legacy"]["url"] == "https://www.gog.com/en/game/rogue_legacy", f"fetched gog {by.get('Rogue Legacy')}")
+        check("utm" not in by["Rogue Legacy"]["url"] and "steampowered" not in by["Rogue Legacy"]["url"], "gog link kept a tracker or steam id")
+        check(by["Squad"]["store"] == "Epic Games Store" and by["Squad"]["url"] == "https://www.cheapshark.com/redirect?dealID=epicdeal", f"fetched epic {by.get('Squad')}")
+        check(by["No App"]["url"] == "https://www.cheapshark.com/redirect?dealID=noapp", f"fetched steam fallback {by.get('No App')}")
+        check(build.FAILURES == [], f"direct links recorded failures {build.FAILURES}")
+        check(any(headers == build.UA for url, headers, _timeout in calls if "cheapshark.com" in url), "CheapShark call dropped the bot user agent")
+        ambiguous = build.gog_store_url("Ambiguous")
+        missing = build.gog_store_url("Missing")
+        check(ambiguous == "" and missing == "", f"unsafe gog match {ambiguous!r} {missing!r}")
+        broken = build.gog_store_url("Broken")
+        check(broken == "" and build.FAILURES == [], f"catalog error {broken!r} {build.FAILURES}")
+    finally:
+        build.requests.get = old_get
+        build.FAILURES.clear()
+
 def test_voice_and_itemlist():
     blurb = build.voice_blurb(
         "The Switch 2 version of 007 First Light",
@@ -1059,6 +1161,7 @@ if __name__ == "__main__":
     test_affiliates()
     test_subscribe()
     test_cheapshark_retry()
+    test_direct_deal_urls()
     test_epic_upcoming_and_faq()
     test_static_config()
     test_rss_and_breadcrumbs()

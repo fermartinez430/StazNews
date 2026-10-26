@@ -2,7 +2,7 @@
 import json, os, re, sys, html, time, datetime as dt
 from email.utils import format_datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 from xml.sax.saxutils import escape as xml_escape
 import requests, feedparser
 import config as C
@@ -907,6 +907,81 @@ def fetch_gamerpower(offline=False, now=None):
     except Exception as e: FAILURES.append(f"gamerpower parse: {e}")
     return out
 
+def store_title_tokens(title):
+    """Words for an exact store-catalog match. Apostrophes stay inside a word."""
+    text = str(title or "").casefold()
+    for ch in ("\u2019", "\u2018", "\u02bc", "`", "\u00b4"):
+        text = text.replace(ch, "'")
+    return re.findall(r"[0-9a-z]+(?:'[0-9a-z]+)?", text)
+
+def steam_app_id(value):
+    text = str(value or "").strip()
+    if not text.isdigit() or int(text) <= 0:
+        return ""
+    return text
+
+def cheapshark_deal_url(deal_id):
+    return "https://www.cheapshark.com/redirect?dealID=" + str(deal_id or "")
+
+def gog_page_url(link):
+    """https://www.gog.com path only. Query and fragment are dropped."""
+    parts = urlsplit(str(link or "").strip())
+    host = parts.netloc.lower()
+    if parts.scheme != "https" or host not in {"www.gog.com", "gog.com"}:
+        return ""
+    if parts.path in ("", "/"):
+        return ""
+    return urlunsplit(("https", "www.gog.com", parts.path, "", ""))
+
+def gog_store_url(title):
+    """GOG product page when one catalog title matches. Otherwise empty.
+
+    A catalog error falls back to the CheapShark redirect at the call site.
+    """
+    wanted = store_title_tokens(title)
+    if not wanted:
+        return ""
+    endpoint = "https://catalog.gog.com/v1/catalog?limit=20&query=like:" + quote(str(title), safe="")
+    try:
+        response = requests.get(endpoint, headers=UA, timeout=20)
+        response.raise_for_status()
+        products = response.json().get("products") or []
+    except Exception:
+        return ""
+    if not isinstance(products, list):
+        return ""
+    found = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        if store_title_tokens(product.get("title")) != wanted:
+            continue
+        page = gog_page_url(product.get("storeLink"))
+        if page and page not in found:
+            found.append(page)
+    if len(found) == 1:
+        return found[0]
+    return ""
+
+def direct_store_url(deal, store_name):
+    """Store page when it is known, otherwise the CheapShark redirect.
+
+    Steam deals include steamAppID. That id is only the Steam app, so a
+    GOG, Humble, or Epic deal keeps its own page even when the same id is set.
+    The store name comes from the CheapShark stores list.
+    """
+    redirect = cheapshark_deal_url(deal.get("dealID"))
+    name = re.sub(r"\s+", " ", str(store_name or "")).strip().casefold()
+    if name == "steam":
+        app = steam_app_id(deal.get("steamAppID"))
+        if app:
+            return f"https://store.steampowered.com/app/{app}/"
+    if name == "gog":
+        page = gog_store_url(deal.get("title"))
+        if page:
+            return page
+    return redirect
+
 def fetch_deals(offline=False):
     if offline: return []
     r = cheapshark_get("https://www.cheapshark.com/api/1.0/deals?storeID=1,7,11,25&sortBy=Deal%20Rating&pageSize=40&onSale=1")
@@ -925,10 +1000,11 @@ def fetch_deals(offline=False):
             icon = ""
             if (info.get("images") or {}).get("icon"):
                 icon = safe_img("https://www.cheapshark.com" + info["images"]["icon"])
-            out.append({"title": d["title"], "store": info.get("storeName") or ("Store " + d["storeID"]),
+            store_name = info.get("storeName") or ("Store " + d["storeID"])
+            out.append({"title": d["title"], "store": store_name,
                 "price": d["salePrice"], "normal": d["normalPrice"], "savings": round(float(d["savings"])),
                 "metacritic": d.get("metacriticScore"),
-                "url": "https://www.cheapshark.com/redirect?dealID=" + d["dealID"],
+                "url": direct_store_url(d, store_name),
                 "image": safe_img(d.get("thumb")), "icon": icon})
     except Exception as e: FAILURES.append(f"cheapshark parse: {e}")
     return out[:30]
