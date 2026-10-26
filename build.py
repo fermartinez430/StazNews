@@ -988,8 +988,11 @@ footer{color:var(--mut);font-size:.85rem;padding:24px 16px;border-top:1px solid 
 LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#18221d"/><ellipse cx="32" cy="38" rx="20" ry="16" fill="#a0703f"/><circle cx="25" cy="34" r="3" fill="#222"/><circle cx="39" cy="34" r="3" fill="#222"/><ellipse cx="32" cy="43" rx="7" ry="4" fill="#6b4423"/><path d="M12 32a20 20 0 0 1 40 0" stroke="#4ade80" stroke-width="5" fill="none"/><rect x="8" y="30" width="7" height="12" rx="3" fill="#4ade80"/><rect x="49" y="30" width="7" height="12" rx="3" fill="#4ade80"/></svg>'
 
 NAV = [("/", "Home"), ("/free-games/", "Free games"), ("/deals/", "Deals"), ("/news/", "News"), ("/newsletter/", "Newsletter"), ("/about/", "About")]
+# Pages rebuilt from live feeds. They get the visible Updated line, WebPage.dateModified, and ItemList.dateModified.
+FRESHNESS_PATHS = ("/", "/free-games/", "/free-games/epic/", "/deals/", "/news/")
 CRUMBS = {
     "/free-games/": "Free games",
+    "/free-games/epic/": "Epic free games",
     "/deals/": "Deals",
     "/news/": "News",
     "/newsletter/": "Newsletter",
@@ -1019,11 +1022,16 @@ def form_action():
     return href("/api/subscribe")
 
 def breadcrumb_ld(path):
-    """Home, then this page. The homepage itself has no breadcrumb."""
-    return {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+    """Home, then this page. The Epic page also lists Free games. The homepage itself has no breadcrumb."""
+    items = [
         {"@type": "ListItem", "position": 1, "name": "Home", "item": C.BASE_URL + "/"},
-        {"@type": "ListItem", "position": 2, "name": CRUMBS.get(path) or "Page", "item": C.BASE_URL + path},
-    ]}
+    ]
+    if path == "/free-games/epic/":
+        items.append({"@type": "ListItem", "position": 2, "name": CRUMBS["/free-games/"], "item": C.BASE_URL + "/free-games/"})
+        items.append({"@type": "ListItem", "position": 3, "name": CRUMBS[path], "item": C.BASE_URL + path})
+    else:
+        items.append({"@type": "ListItem", "position": 2, "name": CRUMBS.get(path) or "Page", "item": C.BASE_URL + path})
+    return {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": items}
 
 def feed_links(path):
     """News feed on every page. The free-games feed is discovered from that page."""
@@ -1035,18 +1043,31 @@ def feed_links(path):
         for feed_path, label in tags
     )
 
+def webpage_ld(path, title, desc, iso):
+    """WebPage stamp for a feed-backed page. iso is the build time with a numeric offset."""
+    return {"@context": "https://schema.org", "@type": "WebPage", "name": title, "description": desc,
+            "url": C.BASE_URL + path, "dateModified": iso, "inLanguage": "en",
+            "isPartOf": {"@type": "WebSite", "name": C.SITE_NAME, "url": C.BASE_URL + "/"}}
+
 def page(path, title, desc, body, updated, jsonld=()):
     url = C.BASE_URL + path
     org = {"@context": "https://schema.org", "@type": "Organization", "name": C.SITE_NAME, "url": C.BASE_URL + "/",
            "logo": C.BASE_URL + "/logo.svg", "sameAs": [f"https://x.com/{C.X_HANDLE}"],
            "founder": {"@type": "Person", "name": C.OPERATOR, "sameAs": f"https://x.com/{C.OPERATOR_X}"}}
     site = {"@context": "https://schema.org", "@type": "WebSite", "name": C.SITE_NAME, "url": C.BASE_URL + "/", "description": C.TAGLINE}
-    blocks = [org, site, *jsonld]
+    iso = updated.isoformat()
+    stamped = []
+    for block in jsonld:
+        if path in FRESHNESS_PATHS and isinstance(block, dict) and block.get("@type") == "ItemList":
+            block = {**block, "dateModified": iso}
+        stamped.append(block)
+    blocks = [org, site, *stamped]
+    if path in FRESHNESS_PATHS:
+        blocks.append(webpage_ld(path, title, desc, iso))
     if path != "/":
         blocks.append(breadcrumb_ld(path))
     lds = "".join(f'<script type="application/ld+json">{json.dumps(j, ensure_ascii=False).replace("</", "<\\/")}</script>' for j in blocks)
     nav = "".join(f'<a href="{href(h)}"{" aria-current=page" if h == path else ""}>{n}</a>' for h, n in NAV)
-    iso = updated.isoformat()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="impact-site-verification" value="16c69e26-fc4d-424f-a478-069c40c6c520">
 <title>{esc(title)}</title><meta name="description" content="{esc(desc)}"><link rel="canonical" href="{url}">
@@ -1230,15 +1251,245 @@ def faq_entries(free, upcoming):
         ("What do these Epic games normally cost?", cost_answer),
     ]
 
-def faq_section(entries):
+def faq_section(entries, heading="Free games FAQ"):
     blocks = "".join(f"<h3>{esc(q)}</h3><p>{esc(a)}</p>" for q, a in entries)
-    return f'<section class="faq" id="faq" aria-labelledby="faq-title"><h2 id="faq-title">Free games FAQ</h2>{blocks}</section>'
+    return f'<section class="faq" id="faq" aria-labelledby="faq-title"><h2 id="faq-title">{esc(heading)}</h2>{blocks}</section>'
 
 def faq_jsonld(entries):
     return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [
         {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}
         for q, a in entries
     ]}
+
+def zone_clocks(iso):
+    """Spoken US Central and UTC clocks for an aware timestamp, or None when it cannot be read."""
+    raw = str(iso or "").strip()
+    if not raw:
+        return None
+    try:
+        when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if when.tzinfo is None:
+        return None
+
+    def speak(moment):
+        clock = moment.strftime("%I:%M %p").lstrip("0")
+        return f"{moment.strftime('%B')} {moment.day}, {moment.year} at {clock}"
+
+    central = when.astimezone(CT)
+    utc = when.astimezone(dt.timezone.utc)
+    return speak(central) + " Central Time", speak(utc) + " UTC"
+
+def plain_when(iso):
+    """Exact timestamp in US Central Time, with the same moment in UTC. Empty when iso is unusable."""
+    clocks = zone_clocks(iso)
+    if not clocks:
+        return ""
+    return f"{clocks[0]} ({clocks[1]})"
+
+def time_sentence(iso):
+    """Visible clock with a machine-readable <time> on the Central Time half."""
+    clocks = zone_clocks(iso)
+    if not clocks:
+        return ""
+    ct_text, utc_text = clocks
+    return f'<time datetime="{esc(iso)}">{esc(ct_text)}</time> ({esc(utc_text)})'
+
+def epic_named(games):
+    return join_names(g.get("title") or "A game" for g in games)
+
+def epic_title(current):
+    if current:
+        return f"Epic Games Free Games This Week: {epic_named(current)} | {C.SITE_NAME}"
+    return f"Epic Games Free Games This Week | {C.SITE_NAME}"
+
+def epic_description(current, upcoming):
+    if current:
+        verb = "is" if len(current) == 1 else "are"
+        text = f"{epic_named(current)} {verb} free on the Epic Games Store this week."
+    else:
+        text = "No Epic Games Store game is free to keep this week."
+    if upcoming:
+        label = "Next free Epic game" if len(upcoming) == 1 else "Next free Epic games"
+        text += f" {label}: {epic_named(upcoming[:3])}."
+    else:
+        text += " The next free Epic game has not been announced yet."
+    return text + " See exact start and end times in US Central Time and UTC."
+
+def epic_intro(current, upcoming):
+    """Short original summary. Dates are written out so the first paragraph stands alone."""
+    parts = [
+        "Epic Games Store puts one or more PC games up for free every week. Claim a game before its promotion ends and it stays in your library. The windows below are the times Epic published, written in US Central Time with the same moment in UTC.",
+    ]
+    if current:
+        parts.append(epic_current_sentence(current))
+    else:
+        parts.append("No Epic game is free to keep right now.")
+    if upcoming:
+        label = "Next free Epic game" if len(upcoming) == 1 else "Next free Epic games"
+        parts.append(f"{label}: {epic_upcoming_sentence(upcoming)}.")
+    else:
+        parts.append("Epic has not posted the next free game yet.")
+    return " ".join(parts)
+
+def epic_current_sentence(current):
+    """One sentence for the live Epic games. A shared deadline is written once."""
+    named = []
+    for game in current:
+        named.append((game.get("title") or "A game", plain_when(game.get("ends"))))
+    ends = {when for _, when in named if when}
+    if len(named) == 1:
+        title, when = named[0]
+        return f"{title} is free until {when}." if when else f"{title} is free to keep right now."
+    if ends and len(ends) == 1 and all(when for _, when in named):
+        return f"{join_names(title for title, _ in named)} are free until {next(iter(ends))}."
+    bits = []
+    for title, when in named:
+        bits.append(f"{title} is free until {when}" if when else f"{title} is free to keep right now")
+    return join_names(bits) + "."
+
+def epic_upcoming_sentence(upcoming):
+    """Names plus the claim window. Games that share a window are grouped."""
+    rows = []
+    for game in upcoming:
+        rows.append((game.get("title") or "A game", plain_when(game.get("starts")), plain_when(game.get("ends"))))
+    windows = {(start, end) for _, start, end in rows}
+    if len(windows) == 1:
+        start, end = next(iter(windows))
+        names = join_names(title for title, _, _ in rows)
+        verb = "is" if len(rows) == 1 else "are"
+        if start and end:
+            return f"{names} {verb} free from {start} until {end}"
+        if start:
+            return f"{names} {verb} free starting {start}"
+        if end:
+            return f"{names} {verb} free until {end}"
+        return names
+    bits = []
+    for title, start, end in rows:
+        if start and end:
+            bits.append(f"{title} is free from {start} until {end}")
+        elif start:
+            bits.append(f"{title} starts {start}")
+        elif end:
+            bits.append(f"{title} is free until {end}")
+        else:
+            bits.append(f"{title} is scheduled next")
+    return join_names(bits)
+
+def epic_schedule_html(game, upcoming=False):
+    if upcoming:
+        start, end = time_sentence(game.get("starts")), time_sentence(game.get("ends"))
+        if start and end:
+            return f"Free from {start} until {end}."
+        if start:
+            return f"Free from {start}."
+        if end:
+            return f"Free until {end}."
+        return "Epic has not published a claim window for this game yet."
+    end = time_sentence(game.get("ends"))
+    if end:
+        return f"Claim by {end}."
+    return "Epic has not published an end time for this giveaway."
+
+def epic_list_section(section_id, heading, note, games, upcoming=False):
+    """Card list for one Epic group. Omitted entirely when that group is empty."""
+    if not games:
+        return ""
+    cards = []
+    for game in games:
+        url, affiliate = with_affiliate(game.get("url"), game.get("platform") or game.get("source") or "")
+        label = '<span class="ad">Affiliate</span>' if affiliate else ""
+        title = game.get("title") or "Epic game"
+        media = media_html(game.get("image"), title, short_label(game.get("source") or game.get("platform")))
+        price = listed_price(game.get("worth"))
+        worth = f" Normally {esc(price)}." if price else ""
+        inner = (
+            f'<h3><a class="out" href="{esc(url)}" rel="{OUTBOUND_REL}">{esc(title)}</a>{label}</h3>'
+            f'<p class="meta">{epic_schedule_html(game, upcoming=upcoming)}{worth}</p>'
+        )
+        cards.append(card(media, inner))
+    heading_id = section_id + "-title"
+    return (
+        f'<section id="{section_id}" aria-labelledby="{heading_id}">'
+        f'<h2 id="{heading_id}">{esc(heading)}</h2>'
+        f'<p>{esc(note)}</p>'
+        f'<ul class="cards">{"".join(cards)}</ul>'
+        "</section>"
+    )
+
+def epic_faq_entries(current, upcoming):
+    """Stable Epic questions. Answers stay complete when a list is empty."""
+    change = (
+        "Epic Games Store free games usually change on Thursday at 10:00 AM US Central Time (3:00 PM UTC). "
+        "A giveaway stays claimable until the end time written on this page, and the next game opens at its published start time."
+    )
+    dated = []
+    for game in current or []:
+        when = plain_when(game.get("ends"))
+        if when:
+            dated.append((game.get("title") or "The current game", when))
+    if dated:
+        ends = {when for _, when in dated}
+        if len(ends) == 1:
+            names = join_names(title for title, _ in dated)
+            verb = "ends" if len(dated) == 1 else "end"
+            change += f" {names} {verb} {dated[0][1]}."
+        else:
+            change += " " + join_names(f"{title} ends {when}" for title, when in dated) + "."
+    elif upcoming:
+        first = upcoming[0]
+        start = plain_when(first.get("starts"))
+        if start:
+            change += f" The next one, {first.get('title') or 'the next game'}, starts {start}."
+    keep = (
+        "Yes. A game you claim during a free-to-keep promotion stays in your Epic Games library after the promotion ends. "
+        "You have to claim it before the end time. When the window closes, the price goes back to normal and a game you did not claim is not added for you."
+    )
+    account = (
+        "Yes. You need a free Epic Games Store account. Sign in, open the game page, and choose Get while the promotion is live. "
+        "The game is then tied to that Epic account and can be installed in the Epic Games Launcher."
+    )
+    return [
+        ("When do Epic free games change?", change),
+        ("Do you keep Epic free games forever?", keep),
+        ("Do you need an Epic Games Store account?", account),
+    ]
+
+def epic_landing(current, upcoming):
+    """Body, JSON-LD blocks, title, and description for /free-games/epic/.
+
+    An empty current list or an empty upcoming list drops that section and does not emit an ItemList for it.
+    Both empty still leaves the intro, the FAQ, and valid FAQPage JSON-LD.
+    """
+    current = [game for game in (current or []) if game.get("title")]
+    upcoming = [game for game in (upcoming or []) if game.get("title")]
+    faqs = epic_faq_entries(current, upcoming)
+    links = (
+        f'<p>Other stores are on the <a href="{href("/free-games/")}">free games</a> page. '
+        f'Deals and headlines are on the <a href="{href("/")}">homepage</a>.</p>'
+    )
+    current_note = "These games are free to keep on the Epic Games Store right now. Each line is the claim deadline in US Central Time, with the same moment in UTC."
+    if len(upcoming) == 1:
+        next_heading = "Next free Epic game"
+    else:
+        next_heading = "Next free Epic games"
+    next_note = "Epic has already scheduled these free games. Each line is the exact start and end in US Central Time, with the same moment in UTC."
+    body = (
+        "<h1>Epic Games free games this week</h1>"
+        f"<p>{esc(epic_intro(current, upcoming))}</p>"
+        f"{links}"
+        f"{epic_list_section('epic-now', 'Free on Epic right now', current_note, current)}"
+        f"{epic_list_section('epic-next', next_heading, next_note, upcoming, upcoming=True)}"
+        f"{faq_section(faqs, 'Epic free games FAQ')}"
+    )
+    blocks = []
+    rows = current + upcoming
+    if rows:
+        blocks.append(itemlist("Epic Games free games this week", rows))
+    blocks.append(faq_jsonld(faqs))
+    return body, blocks, epic_title(current), epic_description(current, upcoming)
 
 def llms_upcoming(items):
     if not items:
@@ -1500,14 +1751,17 @@ def build(offline=False):
     def P(path, *a, **k): write(path + "index.html", page(path, *a, now, **k)); pages.append(path)
     P("/", f"{C.SITE_NAME}: Free Games, Game Deals & Gaming News Today",
       f"Today's free PC games, the best game deals and the latest gaming news, updated several times a day. {len(free)} free games right now.",
-      f'<h1>Free games, deals and gaming news, updated daily</h1><p>{esc(C.TAGLINE)}</p><h2>Free right now</h2>{free_list(free, 6)}{upcoming_mention(upcoming)}<p><a href="{href("/free-games/")}">All free games →</a></p><h2>Top deals</h2>{deal_list(deals, 6)}<p><a href="{href("/deals/")}">All deals →</a></p><h2>Latest news</h2>{news_list(news, 6)}<p><a href="{href("/news/")}">All news →</a></p>{form}',
+      f'<h1>Free games, deals and gaming news, updated daily</h1><p>{esc(C.TAGLINE)}</p><h2>Free right now</h2>{free_list(free, 6)}{upcoming_mention(upcoming)}<p><a href="{href("/free-games/")}">All free games →</a> · <a href="{href("/free-games/epic/")}">Epic free games this week</a></p><h2>Top deals</h2>{deal_list(deals, 6)}<p><a href="{href("/deals/")}">All deals →</a></p><h2>Latest news</h2>{news_list(news, 6)}<p><a href="{href("/news/")}">All news →</a></p>{form}',
       jsonld=[itemlist("Free games right now", free[:6])] if free else [])
     faqs = faq_entries(free, upcoming)
     free_ld = [itemlist("Free games right now", free)] if free else []
     P("/free-games/", f"Free Games Right Now ({now:%B %Y}) | {C.SITE_NAME}",
       "Every free-to-keep game giveaway we can find on Epic Games Store, Steam, GOG and more, with end dates in Central Time.",
-      f'<h1>Free games right now</h1><p>Games you can claim and keep for free. Data: Epic Games Store and <a href="https://www.gamerpower.com/">GamerPower</a>. Machine-readable: <a href="{href("/data/free-games.json")}">free-games.json</a>.</p><section id="free-now">{free_list(free)}</section>{upcoming_section(upcoming)}{faq_section(faqs)}{form}',
+      f'<h1>Free games right now</h1><p>Games you can claim and keep for free. <a href="{href("/free-games/epic/")}">Epic Games free games this week</a> lists the current Epic giveaways and the next free Epic game. Data: Epic Games Store and <a href="https://www.gamerpower.com/">GamerPower</a>. Machine-readable: <a href="{href("/data/free-games.json")}">free-games.json</a>.</p><section id="free-now">{free_list(free)}</section>{upcoming_section(upcoming)}{faq_section(faqs)}{form}',
       jsonld=[*free_ld, faq_jsonld(faqs)])
+    epic_free = [g for g in free if g.get("source") == "Epic Games"]
+    epic_body, epic_ld, epic_title_text, epic_desc = epic_landing(epic_free, upcoming)
+    P("/free-games/epic/", epic_title_text, epic_desc, epic_body, jsonld=epic_ld)
     P("/deals/", f"Best PC Game Deals Today | {C.SITE_NAME}",
       "The highest-rated PC game discounts on Steam, GOG, Humble and Fanatical, with sale prices and savings, refreshed several times a day.",
       f'<h1>Top PC game deals</h1><p>Deal data from <a href="https://www.cheapshark.com/">CheapShark</a>. Prices can change at any time. Machine-readable: <a href="{href("/data/deals.json")}">deals.json</a>.</p>{deal_list(deals)}{form}',
@@ -1606,6 +1860,7 @@ def build(offline=False):
 
 ## Pages
 - [Free games]({C.BASE_URL}/free-games/): current free-to-keep game giveaways with end dates, plus upcoming Epic free games
+- [Epic free games]({C.BASE_URL}/free-games/epic/): Epic Games Store games free this week and the next free Epic game, with claim times in US Central Time and UTC
 - [Deals]({C.BASE_URL}/deals/): top-rated PC game discounts (CheapShark data)
 - [News]({C.BASE_URL}/news/): headlines with short summaries, linked to original publishers
 - [About]({C.BASE_URL}/about/): operator, automation and affiliate disclosures

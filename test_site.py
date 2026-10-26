@@ -138,9 +138,101 @@ def check_feeds(out, pages, free_doc, news_doc):
         pages.get("/free-games/", ""),
     )
 
+def check_epic_page(src, parser, docs, out):
+    """The Epic landing page: dates in plain text, FAQ, JSON-LD, and no empty sections."""
+    path = "/free-games/epic/"
+    desc = [m.get("content") for m in parser.tags.get("meta", []) if m.get("name") == "description"]
+    check(parser.title.startswith("Epic Games Free Games This Week"), f"{path}: title {parser.title}")
+    check(desc and "US Central Time and UTC" in desc[0], f"{path}: description {desc}")
+    check(f'href="{build.href("/free-games/")}"' in src, f"{path}: missing free-games link")
+    check(f'href="{build.href("/")}"' in src, f"{path}: missing homepage link")
+    check("Central Time" in src and "UTC" in src, f"{path}: clocks missing")
+    fg = json.load(open(os.path.join(out, "data", "free-games.json"), encoding="utf-8"))
+    epic_now = [g for g in fg.get("games") or [] if g.get("source") == "Epic Games"]
+    upcoming = fg.get("upcoming") or []
+    for game in epic_now:
+        check(game["title"] in parser.title, f"{path}: title missed {game['title']}")
+        check(game["title"] in (desc[0] if desc else ""), f"{path}: description missed {game['title']}")
+    if not epic_now:
+        check("No Epic Games Store game is free" in (desc[0] if desc else ""), f"{path}: empty description {desc}")
+    now_m = re.search(r'<section id="epic-now"[^>]*>(.*?)</section>', src, re.S)
+    next_m = re.search(r'<section id="epic-next"[^>]*>(.*?)</section>', src, re.S)
+    if epic_now:
+        check(now_m is not None, f"{path}: missing current section")
+        block = now_m.group(0) if now_m else ""
+        for game in epic_now:
+            check(build.esc(game["title"]) in block, f"{path}: current card missing {game['title']}")
+            when = build.plain_when(game.get("ends"))
+            clocks = build.zone_clocks(game.get("ends"))
+            if when:
+                check(when in src, f"{path}: plain end missing {when}")
+            if clocks:
+                check(clocks[0] in block and clocks[1] in block, f"{path}: card clocks missing {game['title']}")
+    else:
+        check(now_m is None, f"{path}: empty current section rendered")
+        check("No Epic game is free to keep right now." in src, f"{path}: missing empty-current sentence")
+    if upcoming:
+        check(next_m is not None, f"{path}: missing upcoming section")
+        block = next_m.group(0) if next_m else ""
+        for game in upcoming:
+            check(build.esc(game["title"]) in block, f"{path}: upcoming card missing {game['title']}")
+            for key in ("starts", "ends"):
+                when = build.plain_when(game.get(key))
+                clocks = build.zone_clocks(game.get(key))
+                if when:
+                    check(when in src, f"{path}: plain {key} missing {when}")
+                if clocks:
+                    check(clocks[0] in block and clocks[1] in block, f"{path}: upcoming {key} clocks {game['title']}")
+    else:
+        check(next_m is None, f"{path}: empty upcoming section rendered")
+        check("Epic has not posted the next free game yet." in src, f"{path}: missing empty-upcoming sentence")
+    faqs = [j for j in docs if j.get("@type") == "FAQPage"]
+    check(len(faqs) == 1, f"{path}: expected one FAQPage, got {len(faqs)}")
+    entities = (faqs[0].get("mainEntity") if faqs else None) or []
+    check(faqs and faqs[0].get("@context") == "https://schema.org", f"{path}: FAQPage context")
+    names = [q.get("name") for q in entities]
+    check(names == [
+        "When do Epic free games change?",
+        "Do you keep Epic free games forever?",
+        "Do you need an Epic Games Store account?",
+    ], f"{path}: FAQ questions {names}")
+    for question in entities:
+        answer = question.get("acceptedAnswer") or {}
+        check(question.get("@type") == "Question" and answer.get("@type") == "Answer" and answer.get("text"), f"{path}: FAQ entry {question.get('name')}")
+        check(f"<h3>{build.esc(question.get('name'))}</h3>" in src, f"{path}: FAQ question not visible {question.get('name')}")
+        check(f"<p>{build.esc(answer.get('text'))}</p>" in src, f"{path}: FAQ answer not visible {question.get('name')}")
+        try:
+            json.loads(json.dumps(question))
+        except Exception as exc:
+            check(False, f"{path}: FAQ JSON-LD parse {exc}")
+    lists = [j for j in docs if j.get("@type") == "ItemList"]
+    shown = epic_now + upcoming
+    h3 = 0
+    if now_m:
+        h3 += now_m.group(1).count("<h3>")
+    if next_m:
+        h3 += next_m.group(1).count("<h3>")
+    if shown:
+        check(len(lists) == 1, f"{path}: expected one ItemList, got {len(lists)}")
+        elements = (lists[0].get("itemListElement") if lists else None) or []
+        check(lists and lists[0].get("numberOfItems") == len(elements) == len(shown) == h3, f"{path}: ItemList size {len(elements)} vs {len(shown)} cards {h3}")
+        check(lists and lists[0].get("@context") == "https://schema.org", f"{path}: ItemList context")
+        for game, element in zip(shown, elements):
+            item = element.get("item") or {}
+            offer = item.get("offers") or {}
+            check(item.get("name") == game.get("title") and item.get("url") == game.get("url"), f"{path}: ItemList entry {item}")
+            check(offer.get("price") == "0.00" and offer.get("priceCurrency") == "USD", f"{path}: ItemList price {offer}")
+        try:
+            json.loads(json.dumps(lists[0]))
+        except Exception as exc:
+            check(False, f"{path}: ItemList JSON-LD parse {exc}")
+    else:
+        check(not lists, f"{path}: ItemList without Epic games")
+        check(h3 == 0, f"{path}: cards rendered with no games")
+
 def validate(out, external=False):
     pages = html_pages(out)
-    for req in ["/", "/free-games/", "/deals/", "/news/", "/about/", "/newsletter/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/404.html"]: check(req in pages, f"missing page {req}")
+    for req in ["/", "/free-games/", "/free-games/epic/", "/deals/", "/news/", "/about/", "/newsletter/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/404.html"]: check(req in pages, f"missing page {req}")
     titles, descs, ext = set(), set(), set()
     for path, src in pages.items():
         try: html5lib.HTMLParser(strict=True).parse(src)
@@ -158,6 +250,7 @@ def validate(out, external=False):
         check(tw == [C.BASE_URL + "/og.png"], f"{path}: twitter:image {tw}")
         check(any(m.get("name")=="twitter:card" for m in p.tags.get("meta",[])), f"{path}: missing twitter:card")
         check(re.search(r"Updated <time[^>]*>[^<]+ CT</time>", src), f"{path}: missing Updated CT")
+        check('name="impact-site-verification" value="16c69e26-fc4d-424f-a478-069c40c6c520"' in src, f"{path}: impact verification missing")
         for t in ["header","nav","main","footer","h1"]: check(t in p.tags, f"{path}: missing <{t}>")
         check(len(p.tags.get("h1",[]))==1, f"{path}: needs exactly one h1")
         for img in p.tags.get("img", []):
@@ -223,13 +316,32 @@ def validate(out, external=False):
             check(len(crumbs) == 1, f"{path}: expected one BreadcrumbList, got {len(crumbs)}")
             elements = (crumbs[0].get("itemListElement") if crumbs else None) or []
             check(bool(crumbs) and crumbs[0].get("@context") == "https://schema.org", f"{path}: breadcrumb context")
-            check(len(elements) == 2, f"{path}: breadcrumb length {len(elements)}")
+            crumb_len = 3 if path == "/free-games/epic/" else 2
+            check(len(elements) == crumb_len, f"{path}: breadcrumb length {len(elements)}")
             home_crumb = elements[0] if elements else {}
-            page_crumb = elements[1] if len(elements) > 1 else {}
+            page_crumb = elements[-1] if elements else {}
             check(home_crumb.get("@type") == "ListItem" and home_crumb.get("position") == 1, f"{path}: breadcrumb home position")
             check(home_crumb.get("name") == "Home" and home_crumb.get("item") == C.BASE_URL + "/", f"{path}: breadcrumb home {home_crumb}")
-            check(page_crumb.get("@type") == "ListItem" and page_crumb.get("position") == 2, f"{path}: breadcrumb page position")
+            check(page_crumb.get("@type") == "ListItem" and page_crumb.get("position") == crumb_len, f"{path}: breadcrumb page position")
             check(page_crumb.get("name") == build.CRUMBS.get(path) and page_crumb.get("item") == C.BASE_URL + path, f"{path}: breadcrumb page {page_crumb}")
+            if path == "/free-games/epic/" and len(elements) == 3:
+                parent = elements[1]
+                check(parent.get("@type") == "ListItem" and parent.get("position") == 2, f"{path}: breadcrumb parent position")
+                check(parent.get("name") == "Free games" and parent.get("item") == C.BASE_URL + "/free-games/", f"{path}: breadcrumb parent {parent}")
+        updated_m = re.search(r'Updated <time datetime="([^"]+)">([^<]+) CT</time>', src)
+        if path in build.FRESHNESS_PATHS:
+            check(updated_m is not None, f"{path}: Updated line")
+            stamp = updated_m.group(1) if updated_m else ""
+            check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", stamp), f"{path}: Updated datetime {stamp}")
+            webs = [j for j in docs if j.get("@type") == "WebPage"]
+            check(len(webs) == 1 and webs[0].get("dateModified") == stamp, f"{path}: WebPage dateModified {webs}")
+            check(webs and webs[0].get("url") == C.BASE_URL + path, f"{path}: WebPage url")
+            for item_list in [j for j in docs if j.get("@type") == "ItemList"]:
+                check(item_list.get("dateModified") == stamp, f"{path}: ItemList dateModified {item_list.get('name')}")
+        else:
+            check(not any(j.get("@type") == "WebPage" for j in docs), f"{path}: unexpected WebPage")
+        if path in ("/", "/free-games/"):
+            check(f'href="{build.href("/free-games/epic/")}"' in src, f"{path}: missing Epic page link")
         def check_itemlist(card_h3, price_kind):
             lists = [j for j in docs if j.get("@type") == "ItemList"]
             check(len(lists) == 1, f"{path}: expected one ItemList, got {len(lists)}")
@@ -320,6 +432,8 @@ def validate(out, external=False):
                     check(build.esc(g["title"]) in home, f"homepage mention missed {g['title']}")
             else:
                 check("Coming next on Epic" not in home, "homepage mention rendered with no upcoming games")
+        if path == "/free-games/epic/":
+            check_epic_page(src, p, docs, out)
         for h in p.links:
             if h.startswith("/"):
                 tgt = local_file(out, h)
@@ -341,6 +455,16 @@ def validate(out, external=False):
     check(locs == {C.BASE_URL+p for p in indexed}, f"sitemap mismatch: {locs ^ {C.BASE_URL+p for p in indexed}}")
     check(not any("feed.xml" in (loc or "") for loc in locs), f"sitemap includes a feed: {sorted(locs)}")
     check(C.BASE_URL + "/404.html" not in locs, "404 should not be in the sitemap")
+    check(C.BASE_URL + "/free-games/epic/" in locs, "sitemap missing Epic page")
+    ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+    lastmods = []
+    for url_el in sm.findall(ns + "url"):
+        loc = url_el.findtext(ns + "loc")
+        lastmod = url_el.findtext(ns + "lastmod") or ""
+        lastmods.append(lastmod)
+        check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", lastmod), f"sitemap lastmod {loc} {lastmod}")
+    home_stamp = re.search(r'Updated <time datetime="([^"]+)">', pages.get("/", ""))
+    check(home_stamp is not None and lastmods and set(lastmods) == {home_stamp.group(1)}, f"sitemap lastmod drifted from Updated {lastmods[:1]}")
     rb = open(os.path.join(out,"robots.txt")).read()
     check(f"Sitemap: {C.BASE_URL}/sitemap.xml" in rb, "robots.txt missing sitemap")
     check(f"Allow: {project_prefix() + '/' if project_prefix() else '/'}" in rb, "robots.txt allow path missing project subpath")
@@ -383,7 +507,7 @@ def validate(out, external=False):
             check(build._norm_text(summary) != build._norm_text(item.get("title") or ""), f"news summary pastes the headline: {summary}")
     llms = open(os.path.join(out,"llms.txt")).read()
     check(llms.startswith("# "), "llms.txt malformed")
-    for frag in ("/free-games/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json", "/feed.xml", "/free-games/feed.xml"):
+    for frag in ("/free-games/", "/free-games/epic/", "/deals/", "/news/", "/about/", "/disclosure/", "/privacy/", "/contact/", "/terms/", "/data/free-games.json", "/data/deals.json", "/data/news.json", "/feed.xml", "/free-games/feed.xml"):
         check(C.BASE_URL + frag in llms, f"llms.txt missing {C.BASE_URL}{frag}")
     data = llms.split("## Data", 1)[-1].split("\n## ", 1)[0]
     check(C.BASE_URL + "/feed.xml" in data and C.BASE_URL + "/free-games/feed.xml" in data, "llms.txt Data section missing feeds")
@@ -857,6 +981,118 @@ def test_epic_upcoming_and_faq():
     finally:
         build.FAILURES.clear()
 
+def test_epic_landing():
+    import datetime as dt
+    now = dt.datetime(2026, 10, 21, 9, 30, tzinfo=build.CT)
+    current = [{
+        "title": "Bad Cheese",
+        "platform": "Epic Games Store",
+        "source": "Epic Games",
+        "url": "https://store.epicgames.com/en-US/p/bad-cheese",
+        "worth": "$12.99",
+        "ends": "2026-10-22T15:00:00+00:00",
+        "image": "",
+    }]
+    upcoming = [{
+        "title": "Sker Ritual",
+        "platform": "Epic Games Store",
+        "source": "Epic Games",
+        "url": "https://store.epicgames.com/en-US/p/sker-ritual",
+        "worth": "$24.99",
+        "starts": "2026-10-22T15:00:00+00:00",
+        "ends": "2026-10-29T15:00:00+00:00",
+        "image": "",
+    }, {
+        "title": "Home - A Unique Horror Adventure",
+        "platform": "Epic Games Store",
+        "source": "Epic Games",
+        "url": "https://store.epicgames.com/en-US/p/home",
+        "worth": "$4.99",
+        "starts": "2026-10-22T15:00:00+00:00",
+        "ends": "2026-10-29T15:00:00+00:00",
+        "image": "",
+    }]
+    summer = build.plain_when("2026-10-22T15:00:00+00:00")
+    winter = build.plain_when("2026-01-15T18:00:00+00:00")
+    rollover = build.plain_when("2026-01-16T05:00:00+00:00")
+    check(summer == "October 22, 2026 at 10:00 AM Central Time (October 22, 2026 at 3:00 PM UTC)", summer)
+    check(winter == "January 15, 2026 at 12:00 PM Central Time (January 15, 2026 at 6:00 PM UTC)", winter)
+    check(rollover == "January 15, 2026 at 11:00 PM Central Time (January 16, 2026 at 5:00 AM UTC)", rollover)
+    check(build.plain_when("") == "" and build.plain_when("not-a-date") == "" and build.zone_clocks("2026-10-22T15:00:00") is None, "naive or blank clock accepted")
+
+    def render(now_games, later_games):
+        body, blocks, title, desc = build.epic_landing(now_games, later_games)
+        src = build.page("/free-games/epic/", title, desc, body, now, jsonld=blocks)
+        try:
+            docs = jsonld_docs(src)
+        except Exception as exc:
+            check(False, f"epic JSON-LD parse {exc}")
+            docs = []
+        return body, blocks, title, desc, src, docs
+
+    body, blocks, title, desc, src, docs = render(current, upcoming)
+    types = {doc.get("@type") for doc in docs}
+    check({"ItemList", "FAQPage", "BreadcrumbList", "WebPage", "Organization", "WebSite"} <= types, f"epic types {types}")
+    check("Bad Cheese" in title and "Bad Cheese" in desc, f"names missing from title or description {title} {desc}")
+    check(summer in body, f"intro missed the claim deadline {body[:400]}")
+    check("October 29, 2026 at 10:00 AM Central Time" in body and "October 29, 2026 at 3:00 PM UTC" in body, "upcoming end clocks missing")
+    intro = body.split("</p>", 1)[0]
+    check(intro.count("October 22, 2026 at 10:00 AM Central Time") == 2, f"shared clocks were not grouped {intro}")
+    check(intro.count("October 29, 2026 at 10:00 AM Central Time") == 1, f"shared end repeated {intro}")
+    shared = build.epic_current_sentence(current + [{**current[0], "title": "Agent A"}])
+    check(shared == f"Bad Cheese and Agent A are free until {summer}.", shared)
+    check('id="epic-now"' in body and 'id="epic-next"' in body, "filled epic sections missing")
+    check('href="' + build.href("/free-games/") + '"' in body and 'href="' + build.href("/") + '"' in body, "epic page links")
+    item_lists = [doc for doc in docs if doc.get("@type") == "ItemList"]
+    check(len(item_lists) == 1 and item_lists[0].get("numberOfItems") == 3, f"filled ItemList {item_lists}")
+    check(item_lists and item_lists[0].get("dateModified") == now.isoformat(), f"ItemList dateModified {item_lists}")
+    web = [doc for doc in docs if doc.get("@type") == "WebPage"]
+    check(web and web[0].get("dateModified") == now.isoformat(), f"WebPage dateModified {web}")
+    crumbs = [doc for doc in docs if doc.get("@type") == "BreadcrumbList"]
+    names = [item.get("name") for item in (crumbs[0].get("itemListElement") if crumbs else [])]
+    check(names == ["Home", "Free games", "Epic free games"], f"epic crumbs {names}")
+    faqs = [doc for doc in docs if doc.get("@type") == "FAQPage"]
+    questions = [q.get("name") for q in (faqs[0].get("mainEntity") if faqs else [])]
+    check(questions == [
+        "When do Epic free games change?",
+        "Do you keep Epic free games forever?",
+        "Do you need an Epic Games Store account?",
+    ], f"epic FAQ {questions}")
+    check(all((q.get("acceptedAnswer") or {}).get("text") for q in faqs[0]["mainEntity"]), "blank FAQ answer")
+    check("Bad Cheese ends " + summer in (faqs[0]["mainEntity"][0]["acceptedAnswer"]["text"]), "FAQ missed the live deadline")
+
+    only_body, _, only_title, only_desc, _, only_docs = render(current, [])
+    check('id="epic-now"' in only_body and 'id="epic-next"' not in only_body, "upcoming section rendered with none scheduled")
+    check("Epic has not posted the next free game yet." in only_body, "missing empty upcoming sentence")
+    check("Bad Cheese" in only_title and "has not been announced" in only_desc, f"current-only copy {only_title} {only_desc}")
+    only_lists = [doc for doc in only_docs if doc.get("@type") == "ItemList"]
+    check(len(only_lists) == 1 and only_lists[0].get("numberOfItems") == 1, f"current-only ItemList {only_lists}")
+    check(only_lists and only_lists[0]["itemListElement"][0]["item"]["name"] == "Bad Cheese", "current-only item")
+
+    only_next_body, only_next_blocks, next_title, next_desc, _, only_next_docs = render([], upcoming)
+    check('id="epic-now"' not in only_next_body and 'id="epic-next"' in only_next_body, "current section rendered with none live")
+    check("No Epic game is free to keep right now." in only_next_body, "missing empty current sentence")
+    check("Bad Cheese" not in next_title and "No Epic Games Store game is free" in next_desc, f"empty current copy {next_title} {next_desc}")
+    next_lists = [doc for doc in only_next_docs if doc.get("@type") == "ItemList"]
+    check(len(next_lists) == 1 and next_lists[0].get("numberOfItems") == 2, f"upcoming-only ItemList {next_lists}")
+    check(all((q.get("acceptedAnswer") or {}).get("text") for doc in only_next_blocks if doc.get("@type") == "FAQPage" for q in doc["mainEntity"]), "upcoming-only FAQ blank")
+
+    empty_body, empty_blocks, empty_title, empty_desc, empty_src, empty_docs = render([], [])
+    check('id="epic-now"' not in empty_body and 'id="epic-next"' not in empty_body and "<ul" not in empty_body, f"empty sections rendered {empty_body}")
+    check("No Epic game is free to keep right now." in empty_body and "Epic has not posted the next free game yet." in empty_body, "empty intro")
+    check(not any(doc.get("@type") == "ItemList" for doc in empty_blocks), f"empty ItemList {empty_blocks}")
+    check(empty_title == f"Epic Games Free Games This Week | {C.SITE_NAME}", empty_title)
+    check("No Epic Games Store game is free to keep this week." in empty_desc and "has not been announced" in empty_desc, empty_desc)
+    empty_faq = [doc for doc in empty_docs if doc.get("@type") == "FAQPage"]
+    check(len(empty_faq) == 1 and len(empty_faq[0].get("mainEntity") or []) == 3, f"empty FAQ {empty_faq}")
+    check(all((q.get("acceptedAnswer") or {}).get("text") for q in empty_faq[0]["mainEntity"]), "empty-state FAQ blank")
+    check("When do Epic free games change?" in empty_src and "Central Time" in empty_src and "UTC" in empty_src, "empty FAQ text missing")
+    check(re.search(r'Updated <time datetime="[^"]+">[^<]+ CT</time>', empty_src), "empty epic page missing Updated")
+    try:
+        json.loads(json.dumps(empty_faq[0]))
+    except Exception as exc:
+        check(False, f"empty FAQ JSON-LD {exc}")
+
 def test_rss_and_breadcrumbs():
     import datetime as dt
     updated = dt.datetime(2026, 10, 20, 8, 17, tzinfo=build.CT)
@@ -943,9 +1179,22 @@ def test_rss_and_breadcrumbs():
     home = build.page("/", "Home title unique", "Home description unique.", "<h1>Home</h1>", updated)
     deals = build.page("/deals/", "Deals title unique", "Deals description unique.", "<h1>Deals</h1>", updated)
     free_page = build.page("/free-games/", "Free title unique", "Free description unique.", "<h1>Free</h1>", updated)
-    home_types = {j.get("@type") for j in jsonld_docs(home)}
+    home_docs = jsonld_docs(home)
+    home_types = {j.get("@type") for j in home_docs}
     deal_docs = jsonld_docs(deals)
-    check(home_types == {"Organization", "WebSite"}, f"home JSON-LD {home_types}")
+    check(home_types == {"Organization", "WebSite", "WebPage"}, f"home JSON-LD {home_types}")
+    home_web = next(j for j in home_docs if j.get("@type") == "WebPage")
+    check(home_web.get("dateModified") == updated.isoformat() and home_web.get("url") == C.BASE_URL + "/", f"home dateModified {home_web}")
+    deal_web = [j for j in deal_docs if j.get("@type") == "WebPage"]
+    check(len(deal_web) == 1 and deal_web[0].get("dateModified") == updated.isoformat(), f"deals dateModified {deal_web}")
+    sample = build.itemlist("Top game deals", [{"title": "Hades", "url": "https://example.com/hades", "price": "4.99"}])
+    check("dateModified" not in sample, "itemlist stamps itself")
+    stamped_page = build.page("/deals/", "Deals title unique", "Deals description unique.", "<h1>Deals</h1>", updated, jsonld=[sample])
+    stamped = [j for j in jsonld_docs(stamped_page) if j.get("@type") == "ItemList"]
+    check(stamped and stamped[0].get("dateModified") == updated.isoformat(), f"stamped list {stamped}")
+    check("dateModified" not in sample, "page() mutated the ItemList dict")
+    terms = build.page("/terms/", "Terms title unique", "Terms description unique.", "<h1>Terms</h1>", updated)
+    check("WebPage" not in {j.get("@type") for j in jsonld_docs(terms)}, "terms gained a WebPage stamp")
     check('rel="alternate" type="application/rss+xml"' in home and build.href("/feed.xml") in home, "home news feed link")
     check(build.href("/free-games/feed.xml") not in home, "home advertises the free-games feed")
     check('name="impact-site-verification" value="16c69e26-fc4d-424f-a478-069c40c6c520"' in home, "impact verification tag")
@@ -1060,6 +1309,7 @@ if __name__ == "__main__":
     test_subscribe()
     test_cheapshark_retry()
     test_epic_upcoming_and_faq()
+    test_epic_landing()
     test_static_config()
     test_rss_and_breadcrumbs()
     n, e = validate(C.OUT_DIR, external="--external" in sys.argv)
